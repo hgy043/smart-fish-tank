@@ -74,8 +74,19 @@ extern "C" {
 
 /* 告警滞回：越界即进告警，但要**回到阈值内一定幅度**才退出。
  * 不加滞回的话，数值在阈值上下缓慢游走会让告警位每秒翻转 ——
- * 界面上表现为卡片颜色闪烁，将来还会让 MQTT 告警刷屏。 */
-#define SIM_ALERT_HYST_FRAC         0.080f      /* 退出所需的回内幅度 = 量程 × 该值 */
+ * 界面上表现为卡片颜色闪烁，将来还会让 MQTT 告警刷屏。
+ *
+ * 2026-10-13 由 0.08 调到 0.12：0.08 时随机游走穿越阈值仍偏频繁，
+ * 聊天流里的告警消息一条接一条。 */
+#define SIM_ALERT_HYST_FRAC         0.120f
+
+/* 告警**消息**的最小间隔（秒）。
+ * 与上面的滞回是两回事：滞回管"状态什么时候翻转"，这里管"翻转了要不要说话"。
+ * 随机游走会反复穿越阈值，而告警是给用户看的通知 —— 太密会把聊天流刷满。
+ *
+ * ⚠️ 本值**只抑制消息**，不抑制 `alert_mask`：后者是实时状态，
+ *    卡片该变红就得立刻变红。用户看到的"实时数据"与"通知频率"是两件事。 */
+#define APP_ALERT_MSG_MIN_INTERVAL_S   60
 
 #define SIM_PH_MIN                  6.3f
 #define SIM_PH_MAX                  7.7f
@@ -102,23 +113,56 @@ extern "C" {
  *   monitor_task 余  980 / 3072   => 32%   <-- 偏低，已加到 5120
  * 这些读数是**开机 11 秒**时取的，尚非最坏情况（P2 起有 LVGL、
  * P6 起有摄像头）。P8 压力测试时必须重新核对，不得沿用此处结论。
+ *
+ * 【2026-10-13 按 P7 的实测水位回收】
+ * 接入小智客户端后内部堆跌破验收线，回头核水位发现**栈普遍开大了一倍**：
+ *   ui_task      余 5380 / 8192   => 实际只用 2.8KB
+ *   mqtt_task    余 5404 / 8192   => 实际只用 2.8KB
+ *   monitor_task 余 3004 / 5120   => 实际只用 2.1KB
+ *   xz_client    余 4792 / 8192   => 实际只用 3.4KB（含 TLS 握手峰值）
+ * 据此各下调，仍留 2 倍以上余量。**这是纠正过量分配，不是压缩安全边际。**
+ * sensor_task 余 2084 / 4096 保持不动 —— 已经是 2 倍余量，且它将来要换成
+ * 真实 ADC 读取（会有 I2C 阻塞），不宜再压。
  * ========================================================================== */
 #define APP_TASK_PRIO_SENSOR        5
 #define APP_TASK_STACK_SENSOR       4096
 #define APP_TASK_PRIO_VISION        4
 #define APP_TASK_STACK_VISION       8192
 #define APP_TASK_PRIO_VOICE         4
-#define APP_TASK_STACK_VOICE        8192
+/* 【2026-10-13 实测爆栈后按参考值上调】
+ *
+ * 首版给了 8192，结果**按下语音键的瞬间就爆栈**（"开始上行"日志之后即崩）。
+ * 栈被吃在 `opus_encode()` 上 —— 它内部的 SILK/CELT 调用链很深。
+ *
+ * 参考实现（xiaozhi `audio/audio_service.cc:132`）把这个职责放在
+ * `opus_codec` 任务里，栈是 **2048 × 13 = 26624 字节**，那是同一块板上
+ * 验证过的数字。它所含的工作与本任务一致：
+ *     编码 / 解码 + protocol_->SendAudio()（即 WebSocket + TLS 发送）。
+ * xiaozhi 另外给 `audio_input`（只做取麦克风数据）4096–6144。
+ * 本工程把这两件事合在一个任务里，故直接取其**大头** 26624，
+ * 而不是自己拍一个中间值。
+ *
+ * ⚠️ 注意本工程是 `-Og` 构建（见 CMakeLists 的编译选项），栈帧比
+ *    优化构建大得多 —— 直接照搬"别处够用的更小数字"会再爆一次。
+ *
+ * 【待办】跑通后按 monitor_task 的高水位读数回收，并把依据写在这里。 */
+#define APP_TASK_STACK_VOICE        26624
+/* 播放任务：只做「从环形缓冲取 → 交给 codec」，逻辑极短，
+   栈开销主要是 esp_codec_dev_write 内部那一层。4096 与 audio_service
+   的其它调用方一致。优先级 3（低于 UI 与传感器）—— 偶尔迟一拍只是
+   缓冲多存一点，不影响正确性；反过来压过 UI 才会掉帧。 */
+#define APP_TASK_PRIO_PLAY          3
+#define APP_TASK_STACK_PLAY         4096
 #define APP_TASK_PRIO_AUDIO         3
 #define APP_TASK_STACK_AUDIO        4096
 #define APP_TASK_PRIO_MQTT          3
-#define APP_TASK_STACK_MQTT         8192
+#define APP_TASK_STACK_MQTT         6144    /* 原 8192；实测只用 2.8KB，见上方说明 */
 #define APP_TASK_PRIO_UI            2
-#define APP_TASK_STACK_UI           8192
+#define APP_TASK_STACK_UI           6144    /* 原 8192；实测只用 2.8KB，见上方说明 */
 #define APP_TASK_PRIO_AI            2
 #define APP_TASK_STACK_AI           8192
 #define APP_TASK_PRIO_MONITOR       1
-#define APP_TASK_STACK_MONITOR      5120    /* 原 3072，实测仅余 980 字节 */
+#define APP_TASK_STACK_MONITOR      4096    /* 原 3072→5120（实测余 980）→ 4096（实测只用 2.1KB） */
 
 /* 任务核心绑定：-1 表示不指定 */
 #define APP_TASK_CORE_0             0
@@ -258,6 +302,30 @@ extern "C" {
 
 /* 在 LCD 彩条上叠加进度条，用于长跑观察是否花屏/撕裂 */
 #define P05_TEST_LCD_ANIMATION      0
+
+/* ==========================================================================
+ * P7 语音对话：开机自检开关
+ * ========================================================================== */
+
+/* 麦克风自检（开机时跑，**阻塞约 7 秒**）—— **默认关闭**。
+ *
+ * 【为什么必须实测过，而不是直接取第 0 路】
+ * ES7210 是 4 通道 ADC，板上到底接了几路、DMA 里实际装的是什么，
+ * **本项目一开始完全不知道**（D2 一直是待实测项）。猜错的表现是"录音全静音"，
+ * 而那与"麦克风坏了""I2S 不通""Opus 编码错"在日志上长得一模一样 ——
+ * 混在一起就没法排。所以先用它把这一项单独钉死。
+ *
+ * 【2026-10-13 实测结论（已是既定事实）】
+ *   · 喇叭↔麦克风回环对比 ≈15.8 倍 ⇒ **麦克风通路正常**；
+ *   · RX 实测速率 24157 Hz（配置 24000）⇒ **I2S 时钟正常**；
+ *   · 读回来的是**单声道 24kHz**，不是 4 通道 —— 真因见
+ *     audio_service.c "流式录音"段顶部的 ③。
+ * 结论都已写进对应源码，本开关完成任务，置回 0。
+ *
+ * 【复现方法】置 1 烧录：先跑 4 秒「喇叭响/静交替 + 同时录音」的回环自证，
+ * 再用**对话真正要走的那条 API**（rec_start / rec_read 50 帧）测一次速率。
+ * 二者失败原因完全不同，故分两层做，不能混。 */
+#define APP_TEST_MIC_PROBE          0
 
 #ifdef __cplusplus
 }

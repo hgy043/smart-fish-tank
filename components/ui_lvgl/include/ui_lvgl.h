@@ -139,7 +139,7 @@ void ui_lvgl_flush_probe(uint32_t frames);
 bool ui_lvgl_capture_requested(void);
 
 /**
- * @brief 把一帧标准 RGB565 显示到「小智AI互动」页。
+ * @brief 把一帧标准 RGB565 作为**一条聊天消息**显示到「小智AI互动」页。
  *
  * @param rgb565 标准 native RGB565（即 camera_service_frame() 交出的格式），
  *               尺寸 w×h，行连续。
@@ -148,23 +148,82 @@ bool ui_lvgl_capture_requested(void);
  * @return ESP_OK；ESP_ERR_INVALID_STATE（未初始化）；ESP_ERR_INVALID_ARG（参数非法）；
  *         ESP_ERR_INVALID_SIZE（尺寸超缓冲容量）；ESP_ERR_TIMEOUT（取锁超时）。
  *
+ * @note **照片是聊天流里的一条消息**（与 xiaozhi 的 WeChat 风格一致：
+ *       它的 `SetPreviewImage()` 也是在对话流里建一个图片气泡），
+ *       而不是另开一块固定区域。
+ *
  * @note **双缓冲**：数据先拷进本组件自有的两块缓冲之一（**锁外**完成），
- *       然后才上锁、只做一次 `lv_image_set_src()` 切换指针。锁持有时间是
- *       **微秒级**，不是拷 153 KB 的那几毫秒。
- *       这样做的同时也就满足了「LVGL 正在显示的那块缓冲永远不会被下一帧写」
- *       —— 交替使用两块即可。若改成单缓冲，就会出现"LVGL 正在读、摄像头正在写"
- *       的撕裂（xiaozhi 的 `Capture()` 正是单缓冲，靠的是不发生）。
+ *       然后才上锁、只做一次指针切换。锁持有时间是**微秒级**，
+ *       不是拷 153 KB 的那几毫秒。交替使用两块缓冲也就同时满足了
+ *       「LVGL 正在显示的那块永远不会被下一帧写」—— 撕裂从设计上不可能发生。
  *
  * @warning 传给本函数的源缓冲在返回后即可被调用方复用/覆盖 —— 本函数已拷贝。
+ *          但**本组件内部的那两块缓冲会被 LVGL 长期引用**，故对同一时刻能显示的
+ *          照片数量有约束（见 ui_pages.h 的 `ui_pages_chat_add_photo()` 说明）。
  */
 esp_err_t ui_lvgl_show_photo(const uint16_t *rgb565, int w, int h);
 
+/* ==========================================================================
+ * 聊天流（WeChat 风格，P6-b）
+ * ========================================================================== */
+
+/** 聊天消息的角色 —— 决定气泡的对齐与配色 */
+typedef enum {
+    UI_CHAT_SYSTEM    = 0,   /* 系统：居中，浅灰底 */
+    UI_CHAT_USER      = 1,   /* 用户：右对齐，微信绿底 */
+    UI_CHAT_ASSISTANT = 2,   /* 助手：左对齐，白底 */
+} ui_chat_role_t;
+
 /**
- * @brief 更新拍照区的状态文字与按钮可用性（内部上锁）。
- * @param text           照片区中央的提示；NULL 或空串 = 隐藏。
- * @param button_enabled false = 按钮置灰且点击无效。
+ * @brief 往「小智AI互动」页的聊天流追加一条**文字**消息（内部上锁）。
+ *
+ * @param role 见 ui_chat_role_t
+ * @param text UTF-8 文本；NULL 或空串被忽略。
+ *
+ * @note 超额时会自动删除最早的消息（避免控件无限增长），与 xiaozhi 的
+ *       `MAX_MESSAGES` 同款做法。
  */
-void ui_lvgl_set_ai_status(const char *text, bool button_enabled);
+void ui_lvgl_chat_add(ui_chat_role_t role, const char *text);
+
+/**
+ * @brief 设置拍照按钮的可用性（内部上锁）。
+ * @param ready false = 置灰且点击无效（摄像头不可用时用）。
+ *
+ * @note 不在这里传状态文字 —— 要告诉用户什么，直接
+ *       `ui_lvgl_chat_add(UI_CHAT_SYSTEM, "...")`，那才是聊天流里该有的样子。
+ */
+void ui_lvgl_set_camera_ready(bool ready);
+
+/* ==========================================================================
+ * 语音对话（P7 按键说话）
+ * ========================================================================== */
+
+/** 语音按钮的状态。文案留在界面层 —— 业务代码不该拼 UI 字符串。 */
+typedef enum {
+    UI_TALK_IDLE = 0,       /* 待机：可用时显示"按住说话"，否则"语音（未连接）" */
+    UI_TALK_LISTENING,      /* 正在上行麦克风数据 */
+    UI_TALK_WORKING,        /* 已松手，等服务器识别/思考 */
+    UI_TALK_SPEAKING,       /* 正在播放服务器下行的语音 */
+} ui_talk_state_t;
+
+/**
+ * @brief 【**不加锁**】麦克风按钮当前是否**正被按住**。
+ *
+ * @note 给**锁外**轮询用（与 `ui_lvgl_capture_requested()` 同一条纪律）。
+ *       区别在于它返回的是**状态**而非一次性请求：语音任务取一帧要阻塞 60ms，
+ *       请求式的标志会漏掉"按下-松开"这个事件，状态式的不会。
+ * @note **读取不清零**。按钮不可用时恒为 false。
+ */
+bool ui_lvgl_talk_held(void);
+
+/**
+ * @brief 设置语音按钮的可用性（内部上锁）。
+ * @param ready 连上服务器（见 `xz_is_ready()`）后才为 true。
+ */
+void ui_lvgl_set_talk_ready(bool ready);
+
+/** @brief 设置语音按钮的显示状态（内部上锁）。 */
+void ui_lvgl_set_talk_state(ui_talk_state_t st);
 
 /**
  * @brief 读取「色彩数据发送完成中断」的累计次数。

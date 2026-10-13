@@ -12,6 +12,8 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <math.h>
 #include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
@@ -32,6 +34,9 @@
 #include "audio_service.h"
 #include "ui_lvgl.h"
 #include "camera_service.h"
+#include "xiaozhi_client.h"
+#include "xiaozhi_config.h"
+#include "opus_codec.h"
 #include "app_config.h"
 #include "app_events.h"
 #include "app_types.h"
@@ -114,6 +119,59 @@ static void eco_refresh_links(void)
  * ⚠️ 接真传感器时：把本段整体删掉，改成在 eco_sensor_sample() 里读实际值即可。
  *    阈值判定与 alert_mask 的填充逻辑可以原样保留。
  * ========================================================================== */
+
+/* --------------------------------------------------------------------------
+ * 告警 → 聊天消息
+ *
+ * 告警集合变化时，往「小智AI互动」页的聊天流里追加一条助手消息。
+ * 这样那个页面**不需要假数据**就有真实内容 —— 数据变了它就说一句。
+ *
+ * 线程边界：`eco_sensor_sample()` 跑在 sensor_task 里，**不能**直接调 LVGL
+ * （本工程约定所有 LVGL 调用只在 ui_task 内）。所以这里只把待发的文本写进
+ * 缓冲区并置标志，由 ui_task 取走发送。
+ * -------------------------------------------------------------------------- */
+static const struct {
+    uint32_t    bit;
+    const char *name;
+} k_alert_names[] = {
+    { ECO_ALERT_PH,        "pH"   },
+    { ECO_ALERT_WATER_TMP, "水温" },
+    { ECO_ALERT_AIR_TMP,   "气温" },
+    { ECO_ALERT_HUMIDITY,  "湿度" },
+    { ECO_ALERT_LUX,       "光照" },
+    { ECO_ALERT_TURBIDITY, "浊度" },
+    { ECO_ALERT_TDS,       "TDS"  },
+};
+#define ALERT_NAME_CNT ((int)(sizeof(k_alert_names) / sizeof(k_alert_names[0])))
+
+static char              s_alert_msg[96];
+static volatile bool     s_alert_msg_ready = false;
+
+/** 拼一条给用户看的告警消息。
+ *  只列**哪几项**越界，不逐个报数值 —— 数值「鱼缸情况」页本来就有，
+ *  聊天里再铺一遍反而看不清重点。 */
+static void alert_msg_build(uint32_t mask)
+{
+    if (mask == 0) {
+        snprintf(s_alert_msg, sizeof(s_alert_msg), "各项数据已恢复正常。");
+        return;
+    }
+
+    size_t used = (size_t)snprintf(s_alert_msg, sizeof(s_alert_msg), "⚠ ");
+    for (int i = 0; i < ALERT_NAME_CNT && used < sizeof(s_alert_msg) - 8; i++) {
+        if ((mask & k_alert_names[i].bit) == 0) {
+            continue;
+        }
+        const int n = snprintf(s_alert_msg + used, sizeof(s_alert_msg) - used,
+                               "%s%s", (used > 4) ? "、" : "",
+                               k_alert_names[i].name);
+        if (n < 0) {
+            break;
+        }
+        used += (size_t)n;
+    }
+    snprintf(s_alert_msg + used, sizeof(s_alert_msg) - used, " 数据越界");
+}
 
 /** 上一次的告警状态 —— 滞回判定要用。只有 sensor_task 读写，且在锁内。 */
 static bool s_alert_ph = false, s_alert_wtemp = false, s_alert_atemp = false;
@@ -215,13 +273,31 @@ static void eco_sensor_sample(void)
 
     xSemaphoreGive(s_eco_mutex);
 
-    /* 只在告警集合变化时打一条日志 —— 每秒一条会把串口刷爆，
+    /* 只在告警集合变化时打日志 + 生成聊天消息 —— 每秒一条会把串口刷爆，
        而"告警从无到有/从有到无"正是最需要留下痕迹的时刻。 */
     static uint32_t s_last_mask = 0;
+    static uint32_t s_last_msg_s = 0;       /* 0 = 还没发过告警消息 */
+
     if (mask != s_last_mask) {
         ESP_LOGW(TAG, "告警状态变化: 0x%02"PRIx32" -> 0x%02"PRIx32"（%s）",
                  s_last_mask, mask, mask ? "有越界" : "全部正常");
         s_last_mask = mask;
+
+        /* ---- 冷却：距上一条告警消息不足 APP_ALERT_MSG_MIN_INTERVAL_S 就不发 ----
+           ⚠️ **只抑制消息，不抑制 alert_mask** ——
+              卡片该变红就得立刻变红，那是实时状态；而"要不要说话"是另一回事。
+              随机游走会反复穿越阈值，不加冷却的话聊天流会被告警刷满。 */
+        const uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000LL);
+        if (s_last_msg_s == 0 ||
+            (now_s - s_last_msg_s) >= APP_ALERT_MSG_MIN_INTERVAL_S) {
+
+            s_last_msg_s = now_s;
+
+            /* 先把文本写好，**再**置标志 —— 消费者看到标志时内容必然已就绪。
+               单生产者（sensor_task）+ 单消费者（ui_task），无需更多同步。 */
+            alert_msg_build(mask);
+            s_alert_msg_ready = true;
+        }
     }
 }
 
@@ -735,30 +811,35 @@ static void sensor_task(void *arg)
 }
 
 /* ==========================================================================
- * 拍照（P6-a）
+ * 拍照（P6-a/P6-b）
  *
- * 【为什么是这个次序 —— 这是本轮唯一一处并发要害】
+ * 【为什么是这个次序 —— 这是唯一一处并发要害】
  *
- *   ① ui_lvgl_set_ai_status("拍摄中…")  —— 内部上锁，很快就返回
- *   ② camera_service_capture()          —— **必须在锁外**，最长阻塞 4 秒
- *   ③ ui_lvgl_show_photo()              —— 内部上锁，只切一次指针
+ *   ① ui_lvgl_chat_add(用户, "拍一张看看")  —— 内部上锁，很快返回
+ *   ② ui_lvgl_set_camera_ready(false)       —— 拍摄中禁用按钮，防连点
+ *   ③ camera_service_capture()              —— **必须在锁外**，最长阻塞 4 秒
+ *   ④ ui_lvgl_show_photo()                  —— 内部上锁，把照片作为一条消息追加
  *
- * ② 若是持着 LVGL 锁做，taskLVGL 会被一起卡住 ——
+ * ③ 若是持着 LVGL 锁做，taskLVGL 会被一起卡住 ——
  * 界面停摆、触摸失灵，而且看起来像"死机"。所以按钮回调只置标志，
  * 真正的抓帧留给这里（ui_task）在锁外执行。
  *
- * ① 用的是异步显示：taskLVGL 独立渲染，所以 ② 阻塞的这几秒里，
- * 屏幕上能正常显示"拍摄中…"。
+ * ① 用的是异步显示：taskLVGL 独立渲染，所以 ③ 阻塞的这几秒里，
+ * 屏幕上能正常显示那条用户消息。
  * ========================================================================== */
 static void ui_capture_photo(void)
 {
-    ui_lvgl_set_ai_status("拍摄中…", false);
+    /* 在聊天流里体现为"用户说了一句话" —— 这也是 WeChat 风格的用法：
+       拍照是用户发起的一个动作，就该有一条用户消息。 */
+    ui_lvgl_chat_add(UI_CHAT_USER, "拍一张看看");
+    ui_lvgl_set_camera_ready(false);
 
     const esp_err_t cret = camera_service_capture();
     if (cret != ESP_OK) {
         ESP_LOGE(TAG, "拍照失败: %s（%s）", esp_err_to_name(cret),
                  camera_service_status());
-        ui_lvgl_set_ai_status(camera_service_status(), true);
+        ui_lvgl_chat_add(UI_CHAT_SYSTEM, camera_service_status());
+        ui_lvgl_set_camera_ready(true);
         return;
     }
 
@@ -766,20 +847,405 @@ static void ui_capture_photo(void)
     const uint16_t *px = camera_service_frame(&w, &h);
     if (px == NULL) {
         ESP_LOGE(TAG, "取不到画面帧");
-        ui_lvgl_set_ai_status("取不到画面", true);
+        ui_lvgl_chat_add(UI_CHAT_SYSTEM, "取不到画面，请重试");
+        ui_lvgl_set_camera_ready(true);
         return;
     }
 
     const esp_err_t sret = ui_lvgl_show_photo(px, w, h);
     if (sret != ESP_OK) {
         ESP_LOGE(TAG, "照片上屏失败: %s", esp_err_to_name(sret));
-        ui_lvgl_set_ai_status("显示失败", true);
+        ui_lvgl_chat_add(UI_CHAT_SYSTEM, "照片显示失败，请重试");
+        ui_lvgl_set_camera_ready(true);
         return;
     }
 
-    /* 成功：隐藏提示、恢复按钮文字 */
-    ui_lvgl_set_ai_status(NULL, true);
+    ui_lvgl_set_camera_ready(true);
     ESP_LOGI(TAG, "拍照完成 %dx%d", w, h);
+}
+
+/* ==========================================================================
+ * P7 下行语音的播放缓冲
+ *
+ * 【为什么要一个环形缓冲，而不是在回调里直接播】
+ * `xz_on_audio` 跑在 **xz_client 任务**里，那个任务还要收 WebSocket 帧、
+ * 跑心跳、处理服务器下发的控制消息。如果在回调里直接调
+ * `audio_service_play_pcm()`，它会**按实时速率阻塞**（60ms 的数据就阻塞
+ * 60ms）—— 网络侧立刻被拖住，抖动无从吸收，最后表现为断音和连接超时。
+ *
+ * 所以：回调只把 PCM **放进环形缓冲就返回**（微秒级），
+ * 由独立的 play_task 按音频速率慢慢取出并播放。
+ * 这也正是 xiaozhi 的分层（解码队列 → 播放队列 → 播放任务）的简化版。
+ *
+ * 【容量】2 秒 @24kHz。抖动余量给足，PSRAM 里不差这 96KB。
+ * 【溢出策略】丢**最旧**的，不是丢最新的 —— TTS 是流式的，
+ *   丢新的会让播放永远落后、延迟越积越大；丢旧的只损失一点点音质，
+ *   延迟有界。这和实时音频的通行做法一致。
+ * ========================================================================== */
+#define PLAY_RING_SAMPLES   (24000 * 2)     /* 2 秒 @24kHz */
+#define PLAY_CHUNK_SAMPLES  480             /* 每次取出 20ms，与 I2S 缓冲粒度相称 */
+
+static int16_t          *s_play_ring  = NULL;   /* PSRAM */
+static size_t            s_play_wr    = 0;
+static size_t            s_play_rd    = 0;
+static SemaphoreHandle_t s_play_lock  = NULL;
+static volatile bool     s_speaking   = false;
+static TaskHandle_t      s_play_task_h = NULL;
+
+/* ==========================================================================
+ * 下行 Opus 包的转运队列
+ *
+ * 【为什么不直接在 xz_on_audio 里解码】—— 这是 2026-10-13 实测撞出来的：
+ * `xz_on_audio` 跑在 **esp_websocket_client 自己的任务**里，那个任务的栈
+ * 是**组件默认值**，不归我们管。在里面调 `opus_decode()` 的结果是
+ *     ***ERROR*** A stack overflow in task websocket_task has been detected.
+ * 而且它一崩就是整机复位，连"哪一步崩的"都留不下。
+ *
+ * 参考实现（xiaozhi）正是这么分层的：接收任务只把包塞进 Decode Queue，
+ * 由 `opus_codec` 任务（栈 2048×13 = 26624）去解码。
+ * 我们照做 —— 本工程的 `voice_task` 就是那个大栈任务。
+ *
+ * 【队列容量】24 个包 ≈ **1.4 秒**的下行音频。
+ *   ⚠️ 首版只给了 3 格，实测**不够**：服务器下发 TTS 是**成批**的，
+ *   不是按播放速率匀速吐（日志里出现过"下行包队列已满，丢弃（累计 21 个）"）。
+ *   3 格在成批到达时几毫秒就满了，于是整段整段地丢。
+ *
+ *   正确的做法是**用缓冲解耦**"成批的生产者"与"实时的消费者"，
+ *   而不是指望消费者跑得够快。这段缓冲的意义与后面那个 2 秒 PCM 环形
+ *   缓冲相同，只是它存的是**压缩后**的包（省 20 倍内存）。
+ *
+ *   存储放 **PSRAM**：24 × 1002 ≈ 24KB，内部 RAM 现在很紧；
+ *   队列只被 CPU 访问、不做 DMA 源，放 PSRAM 没有性能问题。
+ *
+ * 【溢出策略】满了丢**新**包并立即返回。绝不能让网络接收任务阻塞 ——
+ *   丢一包只是跳一下音，卡住接收任务会把整条连接拖死。
+ * ========================================================================== */
+typedef struct {
+    uint16_t len;
+    uint8_t  data[OPUS_MAX_PACKET_SIZE];
+} opus_pkt_t;
+
+#define DL_QUEUE_LEN    24
+static QueueHandle_t s_dl_q = NULL;
+/* 静态分配的队列需要调用方提供控制块与存储区。
+   存储区放 PSRAM —— 见上面「队列容量」那段。 */
+static StaticQueue_t s_dl_q_ctrl;
+
+/** 把解码后的 PCM 放进环形缓冲。**非阻塞**，可从中断以外的任意任务调用。 */
+static void play_ring_put(const int16_t *pcm, size_t n)
+{
+    if (s_play_ring == NULL || s_play_lock == NULL || n == 0 || n > PLAY_RING_SAMPLES) {
+        return;
+    }
+    if (xSemaphoreTake(s_play_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return;                     /* 拿不到锁就丢这一帧，绝不阻塞网络任务 */
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        s_play_ring[s_play_wr] = pcm[i];
+        s_play_wr = (s_play_wr + 1) % PLAY_RING_SAMPLES;
+        if (s_play_wr == s_play_rd) {
+            /* 满了：把读指针往前推一格 = 丢掉最旧的一个样本 */
+            s_play_rd = (s_play_rd + 1) % PLAY_RING_SAMPLES;
+        }
+    }
+
+    if (!s_speaking) {
+        s_speaking = true;
+        ui_lvgl_set_talk_state(UI_TALK_SPEAKING);
+    }
+    xSemaphoreGive(s_play_lock);
+}
+
+/** 从环形缓冲取出至多 max 个样本。返回实际取到的数量。 */
+static size_t play_ring_take(int16_t *out, size_t max)
+{
+    if (s_play_ring == NULL || s_play_lock == NULL) {
+        return 0;
+    }
+    if (xSemaphoreTake(s_play_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return 0;
+    }
+
+    size_t n = 0;
+    while (n < max && s_play_rd != s_play_wr) {
+        out[n++] = s_play_ring[s_play_rd];
+        s_play_rd = (s_play_rd + 1) % PLAY_RING_SAMPLES;
+    }
+
+    xSemaphoreGive(s_play_lock);
+    return n;
+}
+
+/* ==========================================================================
+ * 任务：play_task —— 把环形缓冲里的 PCM 按实时速率送给喇叭
+ *
+ * `audio_service_play_pcm()` 会**阻塞到数据被 I2S 取走**，所以循环的节奏
+ * 天然就是音频的节奏，不需要额外的定时。缓冲空了就退化成 20ms 轮询。
+ * ========================================================================== */
+static void play_task(void *arg)
+{
+    (void)arg;
+
+    int16_t *chunk = heap_caps_malloc(PLAY_CHUNK_SAMPLES * sizeof(int16_t),
+                                      MALLOC_CAP_INTERNAL);
+    if (chunk == NULL) {
+        ESP_LOGE(TAG, "play_task 缓冲分配失败，语音播放不可用");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "play_task 就绪（环形缓冲 %d 样本 = 2 秒）",
+             (int)PLAY_RING_SAMPLES);
+
+    uint32_t played = 0;        /* 本轮播放的样本数，播完打印一次 */
+
+    for (;;) {
+        const size_t n = play_ring_take(chunk, PLAY_CHUNK_SAMPLES);
+        if (n == 0) {
+            /* 播完了 —— 把按钮从"回复中"还原，并报出这一轮**实际播了多少**。
+               这条日志是"喇叭到底响没响"的**唯一客观证据**：
+               上层只知道收到了包、解码成功了，但数据有没有真的走到 I2S，
+               只有这里能证明。 */
+            if (s_speaking) {
+                s_speaking = false;
+                ui_lvgl_set_talk_state(UI_TALK_IDLE);
+                ESP_LOGI(TAG, "本轮播放结束：%u 样本 = %.2f 秒 @%dHz",
+                         (unsigned)played, (double)played / AUDIO_SAMPLE_RATE_HZ,
+                         AUDIO_SAMPLE_RATE_HZ);
+                played = 0;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (audio_service_play_pcm(chunk, n) == ESP_OK) {
+            played += (uint32_t)n;
+        }
+    }
+}
+
+/* ==========================================================================
+ * 任务：voice_task —— 按键说话的上行链路（P7）
+ *
+ * 轮询麦克风按钮的"按住"状态，按住期间：
+ *     麦克风 → rec_read(960@16k) → Opus 编码 → xz_send_audio()
+ * 松手即停止上行并告诉服务器"我说完了"。
+ *
+ * 【为什么是轮询而不是事件】
+ * 按钮状态在界面线程里改（LVGL 回调），上行循环却每 60ms 才醒一次。
+ * 用事件就要跨任务传信号量、还要处理"按下-松开发生在两次唤醒之间"的丢失，
+ * 而轮询一个 volatile 状态位天然没有这个问题。代价是最多 60ms 的响应延迟，
+ * 对人按键说话这个场景完全无感。
+ * ========================================================================== */
+static void voice_task(void *arg)
+{
+    (void)arg;
+
+    int16_t *pcm  = malloc(OPUS_UP_FRAME_SAMPLES * sizeof(int16_t));
+    uint8_t *opus = malloc(OPUS_MAX_PACKET_SIZE);
+    /* 下行解码缓冲放 PSRAM：24kHz 的包解出来 2880 字节，
+       而且这块内存只被 CPU 读写、不做 DMA 源，放 PSRAM 没有性能问题；
+       放内部 RAM 又要吃掉 4KB，而内部堆已经很紧。 */
+    int16_t *dec  = heap_caps_malloc(OPUS_DOWN_MAX_SAMPLES * sizeof(int16_t),
+                                     MALLOC_CAP_SPIRAM);
+    /* 收包缓冲放内部：每轮循环都要用，且只有 1KB */
+    opus_pkt_t *pkt = malloc(sizeof(opus_pkt_t));
+
+    if (pcm == NULL || opus == NULL || dec == NULL || pkt == NULL) {
+        ESP_LOGE(TAG, "voice_task 缓冲分配失败，语音对话不可用");
+        free(pcm);
+        free(opus);
+        free(dec);
+        free(pkt);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    bool     listening   = false;
+    uint32_t sent_frames = 0;
+    uint32_t sent_bytes  = 0;
+    uint32_t down_frames = 0;
+
+    for (;;) {
+        /* --- 先把下行队列排空 ---
+           解码必须在这个任务里做，不能放 xz_on_audio 回调里
+           （那跑在 websocket_task 的栈上，装不下 —— 见 s_dl_q 上方）。
+           队列空时这里只是一次零超时的 xQueueReceive 尝试，开销可忽略。 */
+        while (xQueueReceive(s_dl_q, pkt, 0) == pdTRUE) {
+            size_t dn = 0;
+            if (opus_codec_decode(pkt->data, pkt->len, dec,
+                                  OPUS_DOWN_MAX_SAMPLES, &dn) == ESP_OK) {
+                play_ring_put(dec, dn);
+                if (++down_frames == 1) {
+                    ESP_LOGI(TAG, "收到第一帧下行语音：%u 字节 → 解码 %u 样本",
+                             (unsigned)pkt->len, (unsigned)dn);
+                }
+            }
+        }
+
+        /* 按钮被置灰时 ui_lvgl_talk_held() 恒为 false，
+           所以"没连上服务器就按不动"这件事不需要在这里再判一次。 */
+        const bool held = ui_lvgl_talk_held() && xz_is_ready();
+
+        if (held && !listening) {
+            if (audio_service_rec_start() != ESP_OK) {
+                ESP_LOGW(TAG, "录音通路打不开，本次说话作废");
+                ui_lvgl_set_talk_state(UI_TALK_IDLE);
+                while (ui_lvgl_talk_held()) {
+                    vTaskDelay(pdMS_TO_TICKS(50));   /* 等松手，别反复重试 */
+                }
+                continue;
+            }
+            /* 清掉上一段对话在 Opus 预测器里的残留，否则开头会带上一次的话音 */
+            opus_codec_reset();
+            sent_frames = 0;
+            if (xz_listen_start() != ESP_OK) {
+                ESP_LOGW(TAG, "listen/start 发送失败");
+            }
+            listening = true;
+            ui_lvgl_set_talk_state(UI_TALK_LISTENING);
+            ESP_LOGI(TAG, "开始上行（按键说话）");
+        } else if (!held && listening) {
+            listening = false;
+            (void)audio_service_rec_stop();
+            (void)xz_listen_stop();
+            ui_lvgl_set_talk_state(UI_TALK_WORKING);
+            /* 平均帧长是**判断上行到底带没带声音**的关键指标：
+               Opus 开了 DTX，静音帧只有 2~5 字节，而 16kbps 的语音帧约 120 字节。
+               服务器"收到了但不回话"时，看这个数字就知道是音频的问题还是协议的问题。 */
+            ESP_LOGI(TAG, "上行结束：%u 帧 / %u 字节，平均 %u 字节/帧%s",
+                     (unsigned)sent_frames, (unsigned)sent_bytes,
+                     (sent_frames > 0) ? (unsigned)(sent_bytes / sent_frames) : 0,
+                     (sent_frames > 0 && (sent_bytes / sent_frames) < 20)
+                         ? "  <-- 太小，基本是静音（查麦克风增益）" : "");
+        }
+
+        if (!listening) {
+            /* 10ms 而不是 30ms：这个任务在待机时也是**下行包的唯一消费者**，
+               轮询间隔直接决定 TTS 从"到齐"到"开声"的延迟。
+               10ms 空转的开销可以忽略（一次 xQueueReceive 尝试 + 一次读标志）。 */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        size_t got = 0;
+        if (audio_service_rec_read(pcm, OPUS_UP_FRAME_SAMPLES, &got) != ESP_OK
+                || got == 0) {
+            ESP_LOGW(TAG, "取麦克风数据失败，本轮上行中断");
+            listening = false;
+            (void)audio_service_rec_stop();
+            (void)xz_listen_stop();
+            ui_lvgl_set_talk_state(UI_TALK_IDLE);
+            continue;
+        }
+
+        size_t olen = 0;
+        if (opus_codec_encode(pcm, opus, OPUS_MAX_PACKET_SIZE, &olen) != ESP_OK) {
+            continue;               /* 单帧编码失败不致命，继续下一帧 */
+        }
+        if (xz_send_audio(opus, olen) == ESP_OK) {
+            sent_bytes += (uint32_t)olen;
+            sent_frames++;
+        }
+    }
+}
+
+/* ==========================================================================
+ * 小智语音对话的回调（P7）
+ *
+ * ⚠️ 这些回调跑在 **xz_client 自己的任务**上下文（不是 ui_task）。
+ *    直接调 `ui_lvgl_chat_add()` 是**安全**的 —— 它是 ui_lvgl 的对外接口，
+ *    内部自己取 LVGL 递归锁（见 ui_lvgl.h 的线程约定）。
+ *    但**不能**在这里调裸 LVGL 函数，也不能做耗时的事（会拖住 xz 任务）。
+ * ========================================================================== */
+static void xz_on_state(xz_state_t st, const char *detail)
+{
+    /* 状态在重连循环里会被反复刷新（每几秒一次），所以只在**进入关键状态**时
+       才往聊天流里说一句 —— 否则会把界面刷满"正在取配置"。 */
+    static xz_state_t s_last = XZ_STATE_IDLE;
+
+    if (st == s_last) {
+        return;
+    }
+    s_last = st;
+
+    switch (st) {
+    case XZ_STATE_NEED_ACTIVATION: {
+        /* 激活码要显眼 —— 用户得在小智 App 里把它敲进去 */
+        const char *code = xz_activation_code();
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "需要激活\n请在小智 App 里输入：\n【 %s 】",
+                 (code != NULL) ? code : "??????");
+        ui_lvgl_chat_add(UI_CHAT_SYSTEM, buf);
+        break;
+    }
+    case XZ_STATE_READY:
+        ui_lvgl_chat_add(UI_CHAT_SYSTEM, "小智已连接。");
+        /* 连上了才让语音按钮按得动 —— 在此之前的按下都无处可发 */
+        ui_lvgl_set_talk_ready(true);
+        /* 解码器必须按**服务器 hello 给的**采样率建，不能用我们的上行 16kHz 想当然。
+           服务器几乎总是回 24kHz，但这是它的选择，不是我们的常量。 */
+        (void)opus_codec_set_down(xz_down_sample_rate(), XZ_DOWN_FRAME_MS_DEF);
+        break;
+    case XZ_STATE_ERROR:
+        ui_lvgl_set_talk_ready(false);
+        if (detail != NULL) {
+            ui_lvgl_chat_add(UI_CHAT_SYSTEM, detail);
+        }
+        break;
+    default:
+        /* IDLE/OTA/CONNECTING/ACTIVATING 只打日志，不打扰用户；
+           但要**收回语音按钮** —— 离开 READY（含掉线重连）后按下去也没有
+           地方可发，留着它按得动只会制造一个更难查的状态。
+           本函数顶部有"状态没变就直接返回"的短路，所以这里不会反复刷界面。 */
+        ui_lvgl_set_talk_ready(false);
+        break;
+    }
+}
+
+static void xz_on_chat(const char *role, const char *text)
+{
+    if (role == NULL || text == NULL || text[0] == '\0') {
+        return;
+    }
+    /* 打日志而不只是往界面塞 —— 界面在板子上，排障时看不到。
+       这条日志是"服务器到底听懂了什么、回了什么"的唯一可读证据。 */
+    ESP_LOGI(TAG, "对话[%s] %s", role, text);
+
+    ui_chat_role_t r = UI_CHAT_ASSISTANT;
+    if (strcmp(role, "user") == 0) {
+        r = UI_CHAT_USER;
+    } else if (strcmp(role, "system") == 0) {
+        r = UI_CHAT_SYSTEM;
+    }
+    ui_lvgl_chat_add(r, text);
+}
+
+static void xz_on_audio(const uint8_t *opus, size_t len)
+{
+    /* ⚠️⚠️ 本回调跑在 **esp_websocket_client 自己的任务**里，那个任务的栈
+     * 是组件默认值、不归我们控制，**装不下 Opus 解码**。
+     * 在这里解码的实测后果是整机复位（见 s_dl_q 上方的说明）。
+     * 所以这里只做一件事：**入队**，几微秒返回。
+     * 解码与播放分别由 voice_task（大栈）和 play_task 负责。 */
+    if (s_dl_q == NULL || opus == NULL || len == 0 || len > OPUS_MAX_PACKET_SIZE) {
+        return;
+    }
+
+    opus_pkt_t pkt;
+    pkt.len = (uint16_t)len;
+    memcpy(pkt.data, opus, len);
+
+    /* 超时 0：队列满就丢**这一个新包**并返回。
+       绝不能让网络接收任务因为"播放跟不上"而阻塞 —— 丢一包只是跳一下音，
+       卡住接收任务会把整条连接拖死。 */
+    if (xQueueSend(s_dl_q, &pkt, 0) != pdTRUE) {
+        static uint32_t s_dropped = 0;
+        if (++s_dropped % 20 == 1) {
+            ESP_LOGW(TAG, "下行包队列已满，丢弃（累计 %u 个）", (unsigned)s_dropped);
+        }
+    }
 }
 
 /* ==========================================================================
@@ -817,16 +1283,38 @@ static void ui_task(void *arg)
         }
     }
 
-    /* 摄像头可用性一次性问清并写进界面。
+    /* ---- 开屏往聊天流里放两条消息 ----
+       一条系统（说明当前能做什么），一条助手（播报当前水质）。
+       界面一打开就不是空的，也顺便把三种气泡里的两种演示出来。
+
+       ⚠️ 助手那条用的是**真实快照**（eco_snapshot），不是写死的假数据 ——
+          按 Agent.md 12 节的规划，"网络/AI 不可用时返回本地规则建议"本来
+          就是设计要求。等 P7 接上小智服务器后，这条改成服务器返回的内容即可。 */
+    tank_ecosystem_t boot_snap;
+    eco_snapshot(&boot_snap);
+
+    char greet[160];
+    snprintf(greet, sizeof(greet),
+             "水温 %.1f℃，pH %.2f，\n光照 %.0f lx，浊度 %.2f NTU。\n%s",
+             (double)boot_snap.water_temp_c, (double)boot_snap.ph,
+             (double)boot_snap.lux, (double)boot_snap.turbidity_ntu,
+             (boot_snap.alert_mask != 0) ? "有数据越界，详见「鱼缸情况」页。"
+                                         : "各项数据正常。");
+    ui_lvgl_chat_add(UI_CHAT_ASSISTANT, greet);
+    ui_lvgl_chat_add(UI_CHAT_SYSTEM,
+                     "语音对话待 P7 接入；当前可用：拍照");
+
+    /* 摄像头可用性一次性问清并写进按钮状态。
        摄像头在 app_main 第 6.6 步就初始化过了，此处只读状态。
-       不可用时把按钮置灰 + 显示原因 —— 用户点不动时能直接看到为什么，
+       不可用时把按钮置灰并在聊天里说明原因 —— 用户看到的是"为什么"，
        不必去翻串口。 */
     if (camera_service_is_ready()) {
-        ui_lvgl_set_ai_status("点下方按钮拍照", true);
+        ui_lvgl_set_camera_ready(true);
     } else {
         ESP_LOGW(TAG, "摄像头不可用，AI 页拍照按钮已置灰：%s",
                  camera_service_status());
-        ui_lvgl_set_ai_status(camera_service_status(), false);
+        ui_lvgl_chat_add(UI_CHAT_SYSTEM, camera_service_status());
+        ui_lvgl_set_camera_ready(false);
     }
 
     const TickType_t period = pdMS_TO_TICKS(APP_UI_REFRESH_PERIOD_MS);
@@ -847,6 +1335,19 @@ static void ui_task(void *arg)
            理由见 ui_capture_photo() 的说明。 */
         if (ui_lvgl_capture_requested()) {
             ui_capture_photo();
+        }
+
+        /* 告警变化 → 往聊天流里发一条**系统**消息。
+           为什么用系统角色而不是助手角色：告警是"设备在通知你"，
+           不是"助手在回答你"。用助手角色时它前面没有对应的用户提问，
+           看起来就像在**自问自答**（用户实测反馈）。
+           系统消息居中灰底，语义正确；而且它与上一条系统消息会自动折叠，
+           不会堆一屏。
+           由本任务代发，因为约定「所有 LVGL 调用只在 ui_task 内」
+           （sensor_task 只负责写文本 + 置标志）。 */
+        if (s_alert_msg_ready) {
+            s_alert_msg_ready = false;
+            ui_lvgl_chat_add(UI_CHAT_SYSTEM, s_alert_msg);
         }
 
         /* 界面数据不需要 30ms 这么密：读快照本身很便宜，但每次写入标签
@@ -1018,6 +1519,77 @@ void app_main(void)
                  esp_err_to_name(cret), camera_service_status());
     }
 
+    /* 6.7 音频服务（P7）
+       ⚠️ 这一处此前是**缺口**：`audio_service_init()` 全工程只出现在三个
+       p05_* 试验函数里，而那三个开关（P05_TEST_AUDIO / P05_TEST_C1_I2S_COLLISION /
+       P05_TEST_AUDIO_LCD_ORDER）**全是 0**。也就是说 P0.5 之后，正式启动流程里
+       音频一直是未初始化状态 —— 喇叭当时响过，但那是试验代码做的。
+       P7 的语音对话要真用音频，必须在这里补上。
+
+       与摄像头一样**失败不致命**：界面、传感器、巴法云都不受影响。 */
+    const esp_err_t aret = audio_service_init();
+    if (aret != ESP_OK) {
+        ESP_LOGW(TAG, "音频不可用: %s —— 语音对话将无法工作（其余功能不受影响）",
+                 esp_err_to_name(aret));
+    } else {
+        /* 播放通路常开（含功放使能）。**不等到要说话时才开** ——
+           esp_codec_dev 的通道启停不做幂等检查，反复 open/close 会失败，
+           这是 P0.5 已经栽过一次的坑（见 audio_service.c 顶部与 architecture.md 7.2）。
+           xiaozhi 的 AudioService::Start() 同样是一上来就 EnableOutput(true)。 */
+        (void)audio_service_enable_output(true);
+
+#if APP_TEST_MIC_PROBE
+        /* 第一层：回环自证 —— 板子自己响/静交替，验**硬件通路**，
+           不依赖用户在不在说话。首轮实测对比 ≈15.8 倍 ⇒ 麦克风正常。 */
+        ESP_LOGW(TAG, "===== 麦克风回环自证：板子会自己响/静交替，请保持安静 =====");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        (void)audio_service_mic_loopback(4000);
+
+        /* 第二层：用**对话真正要走的那条 API** 再跑一遍。
+           回环验的是硬件，这里验的是封装本身（rec_start / rec_read /
+           24k→16k 重采样 / rec_stop）—— 两者失败的原因完全不同，
+           混在一起就分不清是硬件还是代码。 */
+        if (audio_service_rec_start() == ESP_OK) {
+            const int    n_frames = 50;                 /* 50 × 60ms = 3 秒 */
+            int16_t     *pcm = malloc(AUDIO_REC_FRAME_SAMPLES * sizeof(int16_t));
+            if (pcm != NULL) {
+                const int64_t t0 = esp_timer_get_time();
+                size_t  total = 0;
+                double  sq    = 0.0;
+                int16_t pk    = 0;
+                for (int f = 0; f < n_frames; f++) {
+                    size_t got = 0;
+                    if (audio_service_rec_read(pcm, AUDIO_REC_FRAME_SAMPLES, &got) != ESP_OK) {
+                        ESP_LOGW(TAG, "第 %d 帧读取失败，提前结束", f + 1);
+                        break;
+                    }
+                    for (size_t i = 0; i < got; i++) {
+                        const double v = (double)pcm[i] / 32768.0;
+                        sq += v * v;
+                        const int16_t a = (pcm[i] < 0) ? (int16_t)-pcm[i] : pcm[i];
+                        if (a > pk) {
+                            pk = a;
+                        }
+                    }
+                    total += got;
+                }
+                const int64_t dt = esp_timer_get_time() - t0;
+                ESP_LOGW(TAG, "===== 录音 API 自检 =====");
+                ESP_LOGW(TAG, "  %u 样本 / %.2f 秒 = **%.0f Hz**（期望 16000）%s",
+                         (unsigned)total, (double)dt / 1e6,
+                         (double)total * 1e6 / (double)dt,
+                         (total * 1000000.0 / (double)dt < 15000) ? "  <-- 偏低，需查" : "");
+                ESP_LOGW(TAG, "  峰值 %d，RMS %.5f", (int)pk, sqrt(sq / (double)total));
+                ESP_LOGW(TAG, "========================");
+                free(pcm);
+            }
+            (void)audio_service_rec_stop();
+        } else {
+            ESP_LOGE(TAG, "rec_start 失败 —— 音频输入通路没起来");
+        }
+#endif
+    }
+
     /* 7. 先启动网络服务，再创建依赖它的任务。
        顺序很重要：mqtt_task 一启动就会调用 bafa_mqtt_pump()，若此时发送队列
        还没建好，就会走「服务未就绪」分支。虽然 pump 已经改为等待超时，
@@ -1058,6 +1630,87 @@ void app_main(void)
                                  APP_TASK_CORE_1);
     ESP_ERROR_CHECK(ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     monitor_register("sensor_task", h_sensor);
+
+    /* 8.4 语音编解码与播放链路（P7）
+       放在 xz_client_start() **之前**：客户端一连上就可能收到下行音频，
+       那时环形缓冲与 play_task 必须已经就位，否则第一批音频会被静默丢弃。
+
+       失败不致命 —— 界面、传感器、巴法云照常；只是语音对话用不了。 */
+    const esp_err_t oret = opus_codec_init();
+    if (oret != ESP_OK) {
+        ESP_LOGW(TAG, "Opus 初始化失败: %s（语音对话不可用）", esp_err_to_name(oret));
+    } else {
+        /* 环形缓冲放 PSRAM：96KB，内部 RAM 现在很紧，放不起。
+           它只被 CPU 访问（不做 DMA 源），放 PSRAM 没有性能问题。 */
+        s_play_ring = heap_caps_malloc(PLAY_RING_SAMPLES * sizeof(int16_t),
+                                       MALLOC_CAP_SPIRAM);
+        /* 下行包队列：24 个包 × (1000+2) 字节 ≈ 24KB，**放 PSRAM**。
+           容量与存放位置的取舍见 opus_pkt_t 上方的「队列容量」一段。 */
+        uint8_t *dq_stor = heap_caps_malloc(DL_QUEUE_LEN * sizeof(opus_pkt_t),
+                                            MALLOC_CAP_SPIRAM);
+        if (dq_stor != NULL) {
+            s_dl_q = xQueueCreateStatic(DL_QUEUE_LEN, sizeof(opus_pkt_t),
+                                        dq_stor, &s_dl_q_ctrl);
+        }
+        if (s_play_ring == NULL || s_dl_q == NULL) {
+            ESP_LOGW(TAG, "语音缓冲分配失败（PSRAM/内部堆不足？），对话将不可用");
+        } else {
+            s_play_lock = xSemaphoreCreateMutex();
+            if (s_play_lock == NULL) {
+                ESP_LOGW(TAG, "播放锁创建失败，下行语音将无声");
+            } else {
+                ok = xTaskCreatePinnedToCore(play_task, "play_task",
+                                             APP_TASK_STACK_PLAY, NULL,
+                                             APP_TASK_PRIO_PLAY, &s_play_task_h,
+                                             APP_TASK_CORE_0);
+                if (ok != pdPASS) {
+                    ESP_LOGW(TAG, "play_task 创建失败，下行语音将无声");
+                } else {
+                    monitor_register("play_task", s_play_task_h);
+                }
+            }
+        }
+
+        /* 上行任务常驻：它自己轮询麦克风按钮，没按键时每 30ms 空转一次。
+           做成常驻而不是"按下才创建"，是因为按键说话要求**按下即开始录**，
+           而创建任务 + 首次取帧的延迟会实打实地吃掉开头几百毫秒。 */
+        TaskHandle_t h_voice = NULL;
+        ok = xTaskCreatePinnedToCore(voice_task, "voice_task",
+                                     APP_TASK_STACK_VOICE, NULL,
+                                     APP_TASK_PRIO_VOICE, &h_voice,
+                                     APP_TASK_CORE_0);
+        if (ok != pdPASS) {
+            ESP_LOGW(TAG, "voice_task 创建失败，上行语音不可用");
+        } else {
+            monitor_register("voice_task", h_voice);
+        }
+    }
+
+    /* 8.5 小智语音客户端（P7）
+       它**非阻塞**：内部只创建一个任务就返回，连接/激活/重连全在任务里做。
+       放在这里（Wi-Fi 已启动之后）而不是更早，是为了让它第一次循环时
+       Wi-Fi 大概率已就绪，少打几轮"等待 Wi-Fi"。
+
+       失败不致命 —— 界面、传感器、巴法云都不受影响。 */
+
+    /* 回调必须在 start() **之前**注册，否则会漏掉最早几个状态变化
+       （尤其是"需要激活"——那是最该被看到的一条）。 */
+    const xz_callbacks_t xz_cbs = {
+        .on_state = xz_on_state,
+        .on_chat  = xz_on_chat,
+        .on_audio = xz_on_audio,
+    };
+    xz_set_callbacks(&xz_cbs);
+
+    const esp_err_t xret = xz_client_start();
+    if (xret != ESP_OK) {
+        ESP_LOGW(TAG, "小智客户端启动失败: %s（其余功能不受影响）",
+                 esp_err_to_name(xret));
+    } else {
+        /* 纳入栈水位监控。这个任务要跑 **TLS 握手**，是全工程栈最吃紧的一个，
+           必须能看到它的高水位读数。任务名见 xiaozhi_client.c 的 xTaskCreate。 */
+        monitor_register("xz_client", xTaskGetHandle("xz_client"));
+    }
 
     ok = xTaskCreatePinnedToCore(monitor_task, "monitor_task",
                                  APP_TASK_STACK_MONITOR, NULL,

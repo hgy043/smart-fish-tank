@@ -25,6 +25,7 @@
 
 #include "lvgl.h"
 #include "app_types.h"
+#include "ui_lvgl.h"    /* 只为一个类型：ui_chat_role_t（公共 API 的一部分，只定义一份）*/
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,7 +68,23 @@ void ui_pages_update_tank(const tank_ecosystem_t *snap);
 lv_obj_t *ui_page_make_shell(lv_obj_t *parent, const char *title, bool with_back);
 
 /* ==========================================================================
- * 「小智AI互动」页的拍照接口（P6-a）
+ * 「小智AI互动」页：聊天流（WeChat 风格，P6-b）
+ *
+ * 【为什么是聊天流而不是"照片区 + 按钮"】
+ * xiaozhi 的 WeChat 风格里，**图片本身就是一条消息气泡**（它的
+ * `SetPreviewImage()` 在对话流里建一个 `img_bubble`）。所以照片不必另开区域，
+ * 作为一条消息出现在聊天里即可 —— 两条需求（WeChat 风格、拍照显示）合流。
+ *
+ * 【复用的部分】
+ * 布局与配色搬自 xiaozhi `main/display/lcd_display.cc` 的 WeChat 分支：
+ *   · 气泡三态：用户右对齐绿底 / 助手左对齐白底 / 系统居中灰底
+ *   · 气泡宽度按**实测文本宽度**自适应（不是固定宽度），上限屏宽 85%
+ *   · 最多保留 N 条，超出删最早的（避免控件无限增长）
+ *   · 新消息自动滚到底
+ * **不依赖** xiaozhi 的 Display 基类 / Board 单例 / Settings —— 是纯 LVGL 代码。
+ *
+ * ⚠️ `ui_chat_role_t` 定义在 ui_lvgl.h —— 那是 main 侧唯一可见的公共头，
+ *    角色枚举属于公共 API 的一部分，只定义一份。
  * ========================================================================== */
 
 /**
@@ -85,27 +102,63 @@ lv_obj_t *ui_page_make_shell(lv_obj_t *parent, const char *title, bool with_back
 bool ui_pages_take_capture_request(void);
 
 /**
- * @brief 照片控件（`lv_image`）。交给 ui_lvgl 设置图像源。
- * @note  只应在 ui_lvgl 内部使用；直接调用者须已持 LVGL 锁。
+ * @brief 往聊天流里追加一条文字消息。**调用者须已持 LVGL 锁。**
+ * @note  内部会拷贝文本，不持有调用方的指针。
  */
-lv_obj_t *ui_pages_ai_photo(void);
+void ui_pages_chat_add(ui_chat_role_t role, const char *text);
 
 /**
- * @brief 显示/隐藏照片区的占位提示。
- * @note  调用者须已持 LVGL 锁。拍成第一张照片后应隐藏。
+ * @brief 往聊天流里追加一条**照片**消息。**调用者须已持 LVGL 锁。**
+ *
+ * @param dsc 指向 `lv_image_dsc_t`（标准 native RGB565）。图片会按
+ *            **屏宽70% × 屏高50%** 缩放后放进气泡（照搬 xiaozhi 的
+ *            `SetPreviewImage()`）—— QVGA 图 320×240 在 480×224 的聊天区里
+ *            **1:1 放不下**，不缩放会被裁掉一半。
+ *            ⚠️ **LVGL 会长期引用这块内存**，调用方必须保证它在气泡
+ *            被删除前一直有效且不被改写。
+ *
+ * @note  **同一时刻只保留一张照片**：新照片会先删掉上一张照片气泡。
+ *        这是内存约束下的取舍 —— 本工程的照片缓冲只有两块
+ *        （见 ui_lvgl_config.h 的 UI_LVGL_PHOTO_*），留多了会互相覆盖。
+ *        历史照片属于「SD卡相册」页的职责，不是聊天流的。
  */
-void ui_pages_ai_hint_visible(bool visible);
+void ui_pages_chat_add_photo(const lv_image_dsc_t *dsc);
 
 /**
- * @brief 更新拍照区的状态文字与按钮可用性。
- *
- * @param text           显示在照片区中央的提示（NULL 或空串 = 不显示）。
- *                       拍照前可写「拍摄中…」，失败时写原因。
- * @param button_enabled false = 按钮置灰且点击无效（摄像头不可用时用）。
- *
- * @note 调用者须已持 LVGL 锁。
+ * @brief 设置拍照按钮的可用性。**调用者须已持 LVGL 锁。**
+ * @param ready false = 置灰且点击无效。
  */
-void ui_pages_set_ai_status(const char *text, bool button_enabled);
+void ui_pages_set_camera_ready(bool ready);
+
+/* ==========================================================================
+ * 语音按钮（P7 按键说话）
+ * ========================================================================== */
+
+/**
+ * @brief 【**不加锁**】麦克风按钮当前是否**正被按住**。
+ *
+ * @note 与 `ui_pages_take_capture_request()` 同一条纪律：给**锁外**轮询用。
+ *       区别在于它返回的是**状态**而非**一次性请求** ——
+ *       语音任务取帧一次要阻塞 60ms，请求式的标志会漏掉按下-松开这个事件；
+ *       状态式的不会。
+ *
+ * @note **读取不清零**（每次调用都反映当下真实状态）。
+ * @note 按钮不可用时恒返回 false。
+ */
+bool ui_pages_talk_held(void);
+
+/**
+ * @brief 设置语音按钮的可用性。**调用者须已持 LVGL 锁。**
+ * @param ready 连上服务器后才为 true；false 时置灰且按不动。
+ */
+void ui_pages_set_talk_ready(bool ready);
+
+/**
+ * @brief 设置语音按钮的显示状态。**调用者须已持 LVGL 锁。**
+ * @note 传 UI_TALK_IDLE 会按"当前是否可用"自动选择文案，
+ *       不会把"语音（未连接）"覆盖成"按住说话"。
+ */
+void ui_pages_set_talk_state(ui_talk_state_t st);
 
 #ifdef __cplusplus
 }

@@ -456,7 +456,20 @@ bool ui_lvgl_capture_requested(void)
     return ui_pages_take_capture_request();
 }
 
-void ui_lvgl_set_ai_status(const char *text, bool button_enabled)
+void ui_lvgl_chat_add(ui_chat_role_t role, const char *text)
+{
+    if (!s_ready || text == NULL || text[0] == '\0') {
+        return;
+    }
+    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
+        return;
+    }
+    ui_pages_chat_add(role, text);
+    lvgl_port_unlock();
+    (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
+}
+
+void ui_lvgl_set_camera_ready(bool ready)
 {
     if (!s_ready) {
         return;
@@ -464,7 +477,45 @@ void ui_lvgl_set_ai_status(const char *text, bool button_enabled)
     if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
         return;
     }
-    ui_pages_set_ai_status(text, button_enabled);
+    ui_pages_set_camera_ready(ready);
+    lvgl_port_unlock();
+    (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
+}
+
+bool ui_lvgl_talk_held(void)
+{
+    /* **不加锁** —— 与 ui_lvgl_capture_requested 同理：
+       它只读一个 volatile 标志，目的是让 voice_task 能在锁外轮询。
+       若在这里加锁，voice_task 每 60ms 抢一次 LVGL 锁，
+       会和渲染任务互相拖慢。 */
+    if (!s_ready) {
+        return false;
+    }
+    return ui_pages_talk_held();
+}
+
+void ui_lvgl_set_talk_ready(bool ready)
+{
+    if (!s_ready) {
+        return;
+    }
+    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
+        return;
+    }
+    ui_pages_set_talk_ready(ready);
+    lvgl_port_unlock();
+    (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
+}
+
+void ui_lvgl_set_talk_state(ui_talk_state_t st)
+{
+    if (!s_ready) {
+        return;
+    }
+    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
+        return;
+    }
+    ui_pages_set_talk_state(st);
     lvgl_port_unlock();
     (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
 }
@@ -520,12 +571,14 @@ esp_err_t ui_lvgl_show_photo(const uint16_t *rgb565, int w, int h)
         ESP_LOGW(TAG, "照片已就绪但取锁超时，本轮未切换显示");
         return ESP_ERR_TIMEOUT;
     }
-    lv_image_set_src(ui_pages_ai_photo(), &s_photo_dsc[next]);
-    ui_pages_ai_hint_visible(false);
+    /* 把照片作为一条**聊天消息**追加进去。
+       `ui_pages_chat_add_photo()` 会先删掉上一张照片的气泡 ——
+       这正是双缓冲能只留两块的前提：同一时刻 LVGL 只引用其中一个描述符。 */
+    ui_pages_chat_add_photo(&s_photo_dsc[next]);
     lvgl_port_unlock();
 
     s_photo_cur = next;         /* 只在切换成功后推进 */
     (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
-    ESP_LOGI(TAG, "照片已显示：%dx%d（缓冲 %d）", w, h, next);
+    ESP_LOGI(TAG, "照片已作为消息显示：%dx%d（缓冲 %d）", w, h, next);
     return ESP_OK;
 }

@@ -41,6 +41,11 @@ extern "C" {
 #define TH_ACCENT    0x1565C0   /* 主强调色（按钮） */
 #define TH_OK        0x2E7D32   /* 正常 */
 #define TH_BAD       0xC62828   /* 异常 / 断开 */
+/* 「正在进行中」—— 语音对话的录音/识别/播放三个中间态共用。
+ * 取值与 TH_TEMP 相同是巧合（都在深橙区间），但**语义独立**：
+ * TH_TEMP 是"温度类数据"的标识色，这个则是"此刻有事在跑"的状态色。
+ * 将来换主题时它们是两个可以分开改的决策，故不合并成一个宏。 */
+#define TH_BUSY      0xE65100
 
 /* --- 数据类别强调色 ---
  * 浅底上必须用**深色版**，否则对比度不足看着发虚。
@@ -61,6 +66,29 @@ extern "C" {
 #define TH_H         320
 #define TH_HEADER_H  44         /* 顶栏高度 */
 #define TH_MARGIN    14         /* 页面左右留白 */
+
+/* ==========================================================================
+ * 聊天气泡（WeChat 风格，P6-b）
+ *
+ * 数值取自 xiaozhi 的 LIGHT_THEME（`main/display/lcd_display.cc:75-84`）——
+ * 那套配色在同款板、同尺寸屏上验证过。其中 **0x95EC69 是微信绿**，
+ * 这套风格的识别度主要就来自它（用户消息右对齐 + 绿底）。
+ *
+ * 与页面其它配色并存的方式：**只换气泡，不换页面骨架**。
+ * 顶栏、返回键、字体仍用本工程的 TH_* —— 四个页面看起来才是一套东西。
+ * ========================================================================== */
+#define TH_CHAT_BG      0xDCE1E6   /* 聊天区底色：比页面底色略深，分出层次   */
+#define TH_BUBBLE_USER  0x95EC69   /* 用户气泡：微信绿（右对齐）             */
+#define TH_BUBBLE_AI    0xFFFFFF   /* 助手气泡：白（左对齐，描边用 TH_EDGE） */
+#define TH_BUBBLE_SYS   0xE3E6EA   /* 系统气泡：浅灰（居中）                 */
+#define TH_TEXT_SYS     0x666666   /* 系统消息文字：中灰                     */
+
+/* 聊天气泡的尺寸约定（与 xiaozhi 一致） */
+#define TH_CHAT_RADIUS      8      /* 气泡圆角 */
+#define TH_CHAT_PAD         8      /* 气泡内边距 */
+#define TH_CHAT_GAP_Y       8      /* 气泡之间的行距 */
+#define TH_CHAT_MAX_W       (TH_W * 85 / 100 - 16)   /* 气泡最大宽度：屏宽 85%（= 392） */
+#define TH_CHAT_BAR_H       52     /* 聊天页底部操作栏高度 */
 
 #ifdef __cplusplus
 }

@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_tdm.h"
@@ -387,14 +388,23 @@ esp_err_t audio_service_play_tone(int freq_hz, int duration_ms, int amplitude)
             }
         }
 
-        size_t written = 0;
-        esp_err_t ret = i2s_channel_write(s_tx, buf,
-                                          TONE_CHUNK_SAMPLES * sizeof(int16_t),
-                                          &written, pdMS_TO_TICKS(1000));
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "写入 I2S TX 失败: %s", esp_err_to_name(ret));
+        /* ⚠️ 用 esp_codec_dev_write，**不是**裸 i2s_channel_write。
+         *
+         * 曾经写的是 `i2s_channel_write(s_tx, buf, N*2, ...)`，把**单声道**
+         * 样本直接灌进配置为 **stereo** 的 TX 通道 —— 那样一个样本只占半个
+         * 立体声帧，N 个样本只花 N/48000 秒，于是**实际播放速度是标称的 2 倍**
+         * （1kHz 听成 2kHz）。P0.5 只验了"有没有声音"，听不出音高，
+         * 所以这个错误一直没暴露。
+         *
+         * esp_codec_dev_write 走的是已验证实现（xiaozhi BoxAudioCodec::Write）
+         * 同一条路：codec 是以 `.channel = 1` 打开的，由它负责单声道到
+         * 硬件槽位的映射，写进去多少样本就播多少时间。 */
+        const int wret = esp_codec_dev_write(s_out_dev, buf,
+                                             (int)(TONE_CHUNK_SAMPLES * sizeof(int16_t)));
+        if (wret != ESP_CODEC_DEV_OK) {
+            ESP_LOGE(TAG, "写入 codec 失败: %d", wret);
             free(buf);
-            return ret;
+            return ESP_FAIL;
         }
     }
 
@@ -417,13 +427,12 @@ esp_err_t audio_service_play_silence(int duration_ms)
 
     const int total_chunks = duration_ms / TONE_CHUNK_MS;
     for (int c = 0; c < total_chunks; c++) {
-        size_t written = 0;
-        esp_err_t ret = i2s_channel_write(s_tx, buf,
-                                          TONE_CHUNK_SAMPLES * sizeof(int16_t),
-                                          &written, pdMS_TO_TICKS(1000));
-        if (ret != ESP_OK) {
+        /* 与 play_tone 同理：走 esp_codec_dev_write，不裸写 I2S */
+        if (esp_codec_dev_write(s_out_dev, buf,
+                                (int)(TONE_CHUNK_SAMPLES * sizeof(int16_t)))
+                != ESP_CODEC_DEV_OK) {
             free(buf);
-            return ret;
+            return ESP_FAIL;
         }
     }
 
@@ -431,66 +440,360 @@ esp_err_t audio_service_play_silence(int duration_ms)
     return ESP_OK;
 }
 
-/* ==========================================================================
- * 麦克风电平测量
- * ========================================================================== */
-esp_err_t audio_service_measure_mic(int duration_ms, float *rms_out)
+/**
+ * 播放一段**已经是 24kHz 单声道**的 PCM（P7 下行语音）。
+ *
+ * 与 play_tone 共用同一条已验证的写入路径（esp_codec_dev_write），
+ * 区别只是数据来自网络解码而不是本地生成。
+ */
+esp_err_t audio_service_play_pcm(const int16_t *pcm, size_t samples)
 {
-    if (!s_ready || rms_out == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    if (!s_ready || !s_output_on || pcm == NULL || samples == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const int wret = esp_codec_dev_write(s_out_dev, (void *)pcm,
+                                         (int)(samples * sizeof(int16_t)));
+    if (wret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "播放 PCM 失败: %d", wret);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+/* ==========================================================================
+ * 流式录音（P7 语音对话）
+ *
+ * 设计取舍见 audio_service.h。这里补充三处实现层面的决定：
+ *
+ * ① **通路常开，只切标记**。理由与播放侧同源（见 enable_output 的长注释）：
+ *    esp_codec_dev 的通道启停不做幂等检查，反复 open/close 会失败。
+ *
+ * ② **24k → 16k 用无状态抽取**。比例恰为 3:2，每 3 个输入样本产 2 个输出，
+ *    不需要像通用重采样器那样维护小数位置 —— 见 resample_24k_to_16k()。
+ *    不用 esp-opus-encoder 里那个 OpusResampler，是为了分层：
+ *    audio_service 不该依赖编解码组件。
+ *
+ * ③ **读进来的是单声道 24kHz，不是 4 通道。**
+ *    ⚠️ 这一点 2026-10-13 实测踩过坑，写清楚免得再错：
+ *    ES7210 确实是 4 通道 ADC、也确实工作在 TDM 4 槽，但 esp_codec_dev 的
+ *    set_drv_fs()（platform/audio_codec_data_i2s.c）会**按 channel_mask
+ *    重新配置 TDM 槽位**：
+ *        slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(slot_bits,
+ *                       I2S_SLOT_MODE_STEREO, (i2s_tdm_slot_mask_t)fs->channel_mask);
+ *        slot_cfg.total_slot = fs->channel;
+ *    我们给的 channel_mask = CH0 ⇒ **只采槽位 0**，DMA 交出来的是 24kHz
+ *    单声道、24000 样本/秒。实测正是 23940 样本/秒。
+ *    （xiaozhi 给 CH0|CH1 ⇒ 2 槽位 ⇒ 48000 样本/秒 —— 这正是它每 60ms
+ *      读 2880 个 int16 的由来，数字对得上，可作交叉验证。）
+ *
+ *    此前一度按"480 帧 × 4 通道"解读，算出 6000 帧/秒，误判为"I2S 时钟差 4 倍"。
+ *    真相是 **I2S 一直是 24kHz，从头到尾没坏**，错的是对缓冲的解读；连带的
+ *    "四路通道 RMS 完全一致"也是同一误读的表现 —— 那本就是同一路信号的相邻
+ *    时间样本。教训：**"配置的采样率"与"缓冲里实际装了什么"是两件事，中间隔着
+ *    esp_codec_dev 的重配置，必须实测，不能推断。**
+ * ========================================================================== */
+#define AUDIO_REC_HW_CHANNELS   4    /* ES7210 是 4 通道 ADC（描述硬件，不是缓冲区布局） */
+#define AUDIO_REC_IN_PER_OUT    3    /* 24k → 16k：每 2 个输出样本对应 3 个输入样本 */
+
+static bool     s_rec_on = false;
+static int16_t *s_rec_in = NULL;   /* 24k 单声道原始样本（DMA 可达） */
+
+bool audio_service_rec_active(void)
+{
+    return s_rec_on;
+}
+
+esp_err_t audio_service_rec_start(void)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_rec_on) {
+        return ESP_OK;              /* 幂等 */
     }
 
-    /* 录音按 4 通道打开（ES7210 是 4 通道 ADC），与已验证实现一致 */
+    /* channel = 4 描述的是**硬件**（ES7210 是 4 通道 ADC），必须这么填；
+       channel_mask = CH0 才是**我们要哪一路** —— 它同时决定 DMA 实际采几个
+       槽位，见本段顶部的 ③。 */
     const esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
-        .channel         = 4,
+        .channel         = AUDIO_REC_HW_CHANNELS,
         .channel_mask    = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
         .sample_rate     = AUDIO_SAMPLE_RATE_HZ,
         .mclk_multiple   = 0,
     };
-    int ret = esp_codec_dev_open(s_in_dev, (esp_codec_dev_sample_info_t *)&fs);
+    const int ret = esp_codec_dev_open(s_in_dev, (esp_codec_dev_sample_info_t *)&fs);
     if (ret != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "打开 ES7210 失败: %d", ret);
         return ESP_FAIL;
     }
 
-    /* 同播放侧：esp_codec_dev_open() 已启用 I2S RX 通道，不要手动再启用。
-       下面的 esp_codec_dev_close() 会负责停用。 */
+    /* 麦克风增益必须显式设 —— 不能指望上电默认值。
+       出处与踩坑经过见 audio_service.h 的 AUDIO_MIC_GAIN_DB。
+       与已验证实现一致：对 CH0 这一路设。 */
+    const int gret = esp_codec_dev_set_in_channel_gain(
+        s_in_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), AUDIO_MIC_GAIN_DB);
+    if (gret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "设置麦克风增益失败: %d（录音可能极轻）", gret);
+    }
 
-    const int chunk = 480;      /* 20ms @24kHz */
-    int16_t *buf = heap_caps_malloc(chunk * sizeof(int16_t) * 4,
+    if (s_rec_in == NULL) {
+        const size_t in_blk = AUDIO_REC_FRAME_SAMPLES * AUDIO_REC_IN_PER_OUT / 2;
+        s_rec_in = heap_caps_malloc(in_blk * sizeof(int16_t),
                                     MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (buf == NULL) {
+        if (s_rec_in == NULL) {
+            ESP_LOGE(TAG, "录音缓冲分配失败（%u 字节）",
+                     (unsigned)(in_blk * sizeof(int16_t)));
+            (void)esp_codec_dev_close(s_in_dev);
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "录音缓冲就绪：%u 字节（内部 DMA）",
+                 (unsigned)(in_blk * sizeof(int16_t)));
+    }
+
+    s_rec_on = true;
+    ESP_LOGI(TAG, "录音通路已打开（硬件 24kHz 单声道 → 对外 16kHz 单声道）");
+    return ESP_OK;
+}
+
+esp_err_t audio_service_rec_stop(void)
+{
+    if (!s_rec_on) {
+        return ESP_OK;
+    }
+    s_rec_on = false;
+    (void)esp_codec_dev_close(s_in_dev);
+    ESP_LOGI(TAG, "录音通路已关闭");
+    return ESP_OK;
+}
+
+/** 24k → 16k：精确 3:2。每 3 个输入样本产 2 个输出：
+ *      out[2m]   = in[3m]                       （直接取）
+ *      out[2m+1] = (in[3m+1] + in[3m+2]) / 2    （相邻平均，兼作极轻的抗混叠）
+ *  全程**无状态** —— 这正是选 3:2 这个整数比的好处。 */
+static void resample_24k_to_16k(const int16_t *in, size_t in_n,
+                                int16_t *out, size_t out_n)
+{
+    const size_t pairs = out_n / 2;
+    for (size_t m = 0; m < pairs; m++) {
+        const size_t i = m * AUDIO_REC_IN_PER_OUT;
+        if (i + 2 >= in_n) {
+            out[2 * m]     = 0;
+            out[2 * m + 1] = 0;
+            continue;
+        }
+        out[2 * m]     = in[i];
+        out[2 * m + 1] = (int16_t)(((int32_t)in[i + 1] + (int32_t)in[i + 2]) / 2);
+    }
+}
+
+esp_err_t audio_service_rec_read(int16_t *buf, size_t want, size_t *got)
+{
+    if (!s_ready || !s_rec_on || buf == NULL || got == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (want == 0 || (want % AUDIO_REC_FRAME_SAMPLES) != 0) {
+        ESP_LOGE(TAG, "want 必须是 %d 的整数倍（收到 %u）",
+                 AUDIO_REC_FRAME_SAMPLES, (unsigned)want);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *got = 0;
+    size_t out_done = 0;
+
+    while (out_done < want) {
+        /* 一次搬一个小块：输出 960（16k）对应输入 1440（24k）。 */
+        size_t out_here = want - out_done;
+        if (out_here > AUDIO_REC_FRAME_SAMPLES) {
+            out_here = AUDIO_REC_FRAME_SAMPLES;
+        }
+        const size_t in_here = out_here * AUDIO_REC_IN_PER_OUT / 2;
+
+        /* 用 esp_codec_dev_read 而**不是**裸 i2s_channel_read —— 与已验证的
+           xiaozhi（BoxAudioCodec::Read）同一条路。原因不只是"照搬"：
+           codec 是经 esp_codec_dev_open 打开的，通道的启停归它管，
+           绕过它直接读 I2S 是在两份所有者之间踩线。
+           另：esp_codec_dev_read 内部就是 i2s_channel_read，
+           所以目标缓冲同样必须 DMA 可达（s_rec_in 已按此分配）。 */
+        const int ret = esp_codec_dev_read(s_in_dev, s_rec_in,
+                                           (int)(in_here * sizeof(int16_t)));
+        if (ret != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG, "录音读取失败: %d（本轮已取 %u 样本）",
+                     ret, (unsigned)out_done);
+            break;
+        }
+
+        resample_24k_to_16k(s_rec_in, in_here, buf + out_done, out_here);
+        out_done += out_here;
+    }
+
+    *got = out_done;
+    return (out_done > 0) ? ESP_OK : ESP_FAIL;
+}
+
+/* ==========================================================================
+ * 诊断：喇叭 → 麦克风 回环自证
+ *
+ * 【为什么要做这个】
+ * "麦克风到底响不响"这件事不能靠"让人在正确时刻说话"来测 —— 那个前提
+ * 不受控。2026-10-13 实测就卡在这里：四路 RMS 全程 0.0002，
+ * 无法区分"麦克风不响"与"人没说话"。
+ *
+ * 本项目已因未受控观测栽过跟头（见 app_config.h 中背光结论被自己推翻那段），
+ * 同样的坑不踩第二次。**把声源换成板子自己**：
+ * 每 500ms 交替「响 1kHz / 静音」共 8 轮，同时录音。
+ * 麦克风通不通，看「响」与「静」的 RMS 对比即可，与用户在不在说话无关。
+ *
+ * 【首轮实测结论（2026-10-13）】四路对比均 ≈15.8 倍 ⇒ **麦克风通路正常**。
+ * 同时该试验测出「实测有效速率」——正是它暴露了
+ * "配 24000 却只读到 6000" 的假象，进而挖出 esp_codec_dev 按 channel_mask
+ * 重配 TDM 槽位这件事（见本文件"流式录音"段顶部的 ③）。
+ * 所以本函数不只是"测麦克风"，它是这条链上**唯一不依赖假设**的观测点。
+ *
+ * ⚠️ 需要播放通路已打开（功放使能），否则喇叭不响，本试验无效。
+ * ========================================================================== */
+
+/** 交替相位的长度。500ms 足够长到不被 DMA 抖动淹没，又短到 8 轮只占 8 秒。 */
+#define LOOPBACK_PHASE_MS   500
+#define LOOPBACK_TONE_HZ    1000
+#define LOOPBACK_AMP        20000   /* 够响以便被板上麦克风拾取，又不至于削顶 */
+
+esp_err_t audio_service_mic_loopback(int duration_ms)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_output_on) {
+        ESP_LOGE(TAG, "播放通路未打开 —— 喇叭不响，回环试验无效");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_rec_on) {
+        ESP_LOGE(TAG, "录音通路已打开，请先 audio_service_rec_stop()");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 与 rec_start 用完全相同的参数 —— 试验要测的就是录音真正走的那条路，
+       参数只要有一点不同，结论就不能外推。 */
+    const esp_codec_dev_sample_info_t fs = {
+        .bits_per_sample = 16,
+        .channel         = AUDIO_REC_HW_CHANNELS,
+        .channel_mask    = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
+        .sample_rate     = AUDIO_SAMPLE_RATE_HZ,
+        .mclk_multiple   = 0,
+    };
+    if (esp_codec_dev_open(s_in_dev, (esp_codec_dev_sample_info_t *)&fs) != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "打开 ES7210 失败");
+        return ESP_FAIL;
+    }
+    /* 与 rec_start 用**完全相同**的增益 —— 试验要测的就是录音真正走的那条路，
+       参数差一点，结论就不能外推（增益尤其：不设的话回环对比会假性偏低）。 */
+    (void)esp_codec_dev_set_in_channel_gain(s_in_dev,
+                                            ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
+                                            AUDIO_MIC_GAIN_DB);
+
+    const int chunk_tx = AUDIO_SAMPLE_RATE_HZ / 50;   /* 20ms */
+    const int chunk_rx = AUDIO_SAMPLE_RATE_HZ / 50;   /* 20ms（单声道 24k） */
+
+    int16_t *tx = heap_caps_malloc(chunk_tx * sizeof(int16_t),
+                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    int16_t *rx = heap_caps_malloc(chunk_rx * sizeof(int16_t),
+                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (tx == NULL || rx == NULL) {
+        free(tx);
+        free(rx);
         (void)esp_codec_dev_close(s_in_dev);
         return ESP_ERR_NO_MEM;
     }
 
-    double sum_sq = 0.0;
-    long   count  = 0;
-    const int chunks = duration_ms / 20;
+    const int64_t t_start    = esp_timer_get_time();
+    const int64_t t_end      = t_start + (int64_t)duration_ms * 1000;
+    int64_t       next_phase = t_start + (int64_t)LOOPBACK_PHASE_MS * 1000;
+    bool          tone_on    = true;
+    double        phase      = 0.0;
+    const double  phase_step = 2.0 * M_PI * (double)LOOPBACK_TONE_HZ
+                               / (double)AUDIO_SAMPLE_RATE_HZ;
 
-    for (int c = 0; c < chunks; c++) {
-        size_t got = 0;
-        esp_err_t rret = i2s_channel_read(s_rx, buf, chunk * sizeof(int16_t) * 4, &got,
-                                          pdMS_TO_TICKS(500));
-        if (rret != ESP_OK) {
-            ESP_LOGW(TAG, "读取 I2S RX 失败: %s", esp_err_to_name(rret));
-            break;
+    long   tx_samples = 0, rx_samples = 0;
+    double sec_sq = 0.0;
+    long   sec_n  = 0;
+    /* 按"响"和"静"分别累计 —— **对比度才是判据** */
+    double on_sq  = 0.0, off_sq = 0.0;
+    long   on_n   = 0,   off_n  = 0;
+
+    ESP_LOGW(TAG, "===== 回环自证：喇叭每 %dms 交替 响%dHz / 静音，共 %.1f 秒 =====",
+             LOOPBACK_PHASE_MS, LOOPBACK_TONE_HZ, (double)duration_ms / 1000.0);
+    ESP_LOGW(TAG, "  判据：[响] 行的 RMS 明显高于 [静] 行 ⇒ 麦克风确实在拾音");
+
+    while (esp_timer_get_time() < t_end) {
+        /* --- 生成并写出一个 TX 块 ---
+           与 play_tone() 走同一条已验证的写入路径（esp_codec_dev_write），
+           不裸写 I2S —— 裸写会把单声道样本灌进 stereo 通道，
+           播出来是 2 倍速、高八度，作为"已知频率的声源"就不成立了。
+           本试验一律以墙上时钟为准，不按样本数折算时间。 */
+        for (int i = 0; i < chunk_tx; i++) {
+            tx[i] = tone_on ? (int16_t)(sin(phase) * LOOPBACK_AMP) : 0;
+            phase += phase_step;
+            if (phase > 2.0 * M_PI) {
+                phase -= 2.0 * M_PI;
+            }
         }
-        const int n = (int)(got / sizeof(int16_t));
-        for (int i = 0; i < n; i++) {
-            const double v = (double)buf[i] / 32768.0;
-            sum_sq += v * v;
-            count++;
+        if (esp_codec_dev_write(s_out_dev, tx, (int)(chunk_tx * sizeof(int16_t)))
+                == ESP_CODEC_DEV_OK) {
+            tx_samples += chunk_tx;
+        }
+
+        /* --- 读一个 RX 块（单声道 24k） --- */
+        if (esp_codec_dev_read(s_in_dev, rx, (int)(chunk_rx * sizeof(int16_t)))
+                == ESP_CODEC_DEV_OK) {
+            for (int i = 0; i < chunk_rx; i++) {
+                const double v = (double)rx[i] / 32768.0;
+                sec_sq += v * v;
+                if (tone_on) {
+                    on_sq += v * v;
+                } else {
+                    off_sq += v * v;
+                }
+            }
+            rx_samples += chunk_rx;
+            sec_n += chunk_rx;
+            if (tone_on) {
+                on_n += chunk_rx;
+            } else {
+                off_n += chunk_rx;
+            }
+        }
+
+        if (esp_timer_get_time() >= next_phase) {
+            tone_on = !tone_on;
+            next_phase += (int64_t)LOOPBACK_PHASE_MS * 1000;
+            if (sec_n > 0) {
+                /* 刚翻转过，所以上一相位用的是相反的那个名字 */
+                ESP_LOGW(TAG, "  [%s] RMS=%.5f", tone_on ? "静" : "响",
+                         sqrt(sec_sq / (double)sec_n));
+                sec_sq = 0.0;
+                sec_n  = 0;
+            }
         }
     }
 
-    free(buf);
+    const int64_t elapsed_us = esp_timer_get_time() - t_start;
+
+    free(tx);
+    free(rx);
     (void)esp_codec_dev_close(s_in_dev);
 
-    if (count == 0) {
-        return ESP_FAIL;
-    }
-    *rms_out = (float)sqrt(sum_sq / (double)count);
+    const double rx_rate = (double)rx_samples * 1000000.0 / (double)elapsed_us;
+    const double on_rms  = (on_n  > 0) ? sqrt(on_sq  / (double)on_n)  : 0.0;
+    const double off_rms = (off_n > 0) ? sqrt(off_sq / (double)off_n) : 0.0;
+    const double ratio   = (off_rms > 1e-9) ? (on_rms / off_rms) : 0.0;
+
+    ESP_LOGW(TAG, "===== 回环自证结果 =====");
+    ESP_LOGW(TAG, "  TX 写出 %ld 样本（此数受 DMA 缓冲影响，仅供参照）", tx_samples);
+    ESP_LOGW(TAG, "  RX 实测速率 %.0f Hz（配置 %d Hz）%s",
+             rx_rate, AUDIO_SAMPLE_RATE_HZ,
+             (rx_rate < AUDIO_SAMPLE_RATE_HZ * 0.9) ? "  <-- 偏低，需查" : "");
+    ESP_LOGW(TAG, "  [响]=%.5f  [静]=%.5f  对比=%.2f 倍", on_rms, off_rms, ratio);
+    ESP_LOGW(TAG, "========================");
+    ESP_LOGW(TAG, "判读：对比 > 3 ⇒ 麦克风工作正常；≈1 ⇒ 麦克风/FE 这条链不通。");
     return ESP_OK;
 }

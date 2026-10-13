@@ -4,19 +4,27 @@
 # 布局在已验证的小智工程 (partitions/v1/16m.csv) 基础上调整：
 #   - nvs 从 16KB 扩到 64KB：Wi-Fi 驱动会把 PHY 校准数据写进 NVS
 #     (CONFIG_ESP_WIFI_NVS_ENABLED=y)，后续还要存巴法云/小智凭据，16KB 偏紧；
-#   - model 分区暂不启用（小智语音模型 P5 阶段再开），把空间留给应用与 OTA；
+#   - **model 分区 2026-10-13 启用**（P7 语音对话）：放 esp-sr 的唤醒词模型。
+#     esp-sr 的 CMakeLists 会读本表里的 model 分区，自动把 srmodels.bin
+#     打包并挂到 `idf.py flash` 上 —— **不需要额外的手工烧录步骤**。
 #   - 保留双 OTA 槽位，便于后续接入 OTA 升级。
 #
 # 尺寸校验（全部 4KB 对齐、首尾相接、无重叠）：
 #   nvs      0x009000 .. 0x019000   (0x10000,  64KB)
 #   otadata  0x019000 .. 0x01B000   (0x2000,    8KB)
 #   phy_init 0x01B000 .. 0x01C000   (0x1000,    4KB)
+#   model    0x01C000 .. 0x100000   (0xE4000, 912KB)  <- 填满 phy_init 与 ota_0 之间
 #   ota_0    0x100000 .. 0x700000   (6MB)
 #   ota_1    0x700000 .. 0xD00000   (6MB)
+#
+# 关于 model 的大小：xiaozhi 用 960KB，这里 912KB 是**不挪动其它分区**的前提下
+# 能给出的全部空隙。实测 srmodels.bin 约 291KB（wn9_nihaoxiaozhi_tts + VADNet + NSNet），
+# 余量充足。若日后启用更大的模型集（如 MultiNet 自定义唤醒词），需重新排布。
 # ============================================================================
 # Name,     Type, SubType, Offset,    Size,     Flags
 nvs,        data, nvs,     0x9000,    0x10000,
 otadata,    data, ota,     0x19000,   0x2000,
 phy_init,   data, phy,     0x1B000,   0x1000,
+model,      data, spiffs,  0x1C000,   0xE4000,
 ota_0,      app,  ota_0,   0x100000,  6M,
 ota_1,      app,  ota_1,   0x700000,  6M,

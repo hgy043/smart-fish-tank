@@ -21,6 +21,14 @@ param(
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 $env:IDF_TOOLS_PATH = 'C:\Espressif'
 
+# 若本脚本是从 MSYS/Git-Bash 系终端启动的，MSYSTEM 会随环境变量传进来。
+# idf_tools.py 见到它就 fatal("MSys/Mingw is not supported")，export.ps1 随之失败，
+# 而 build.ps1 里 export.ps1 的 stderr 被丢弃（*> $null），最终只报一句
+# "环境加载失败，IDF_PATH=" —— 症状离原因很远，极难定位。故在此直接摘掉。
+# （正常从 PowerShell/CMD 启动时这两个变量本就不存在，删了也无副作用。）
+Remove-Item Env:MSYSTEM  -ErrorAction SilentlyContinue
+Remove-Item Env:MSYSCON  -ErrorAction SilentlyContinue
+
 # export.ps1 需要 python 在 PATH 上，先挂载 IDF 自带的 Python 环境
 $env:PATH = 'C:\Espressif\python_env\idf5.5_py3.11_env\Scripts;C:\Espressif\tools\idf-python\3.11.2;' + $env:PATH
 

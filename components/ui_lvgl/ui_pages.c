@@ -190,25 +190,49 @@ static void build_menu_page(lv_obj_t *root)
 }
 
 /* ==========================================================================
- * 小智 AI 互动页 —— 拍照与照片显示（P6-a 接入真实摄像头）
+ * 小智 AI 互动页 —— 聊天流（WeChat 风格，P6-b）
  *
- * 【布局】内容区是 480 × (320-44) = 480 × 276
- *     照片区   320 × 240   居中靠上（x = 80，y = 0）
- *     拍照按钮 452 × 32    整宽靠下（y = 242）
- *   320×240 是**原尺寸直显**，不做任何缩放 —— 本工程 CONFIG_LV_CACHE_DEF_SIZE=0
- *   （没有图像缓存），LVGL 缩放要每帧软件重算，既费 CPU 又糊。
+ * 【布局】内容区 480 × (320 - 44) = 480 × 276
+ *     聊天区   480 × 224   可垂直滚动，气泡自上而下堆叠
+ *     操作栏   480 ×  52   底部：[拍照] [语音·占位]
  *
- * 【为什么按钮不做成小圆钮】整宽按钮的命中面积大得多，也不用管对中线。
- *   状态文字（拍摄中/失败原因）直接写在照片区中央，不额外占纵向空间。
+ * 【气泡三态】搬自 xiaozhi `main/display/lcd_display.cc` 的 WeChat 分支：
+ *     用户   右对齐，微信绿 0x95EC69
+ *     助手   左对齐，白底 + 描边
+ *     系统   居中，浅灰底
+ *
+ * 【为什么每行要套一个"整宽行容器"】
+ *   LVGL 的 flex 布局里，**主轴对齐是容器级的，不能逐个孩子设**。
+ *   而右对齐用户气泡、左对齐助手气泡必须在同一个纵向流里共存。
+ *   解法（xiaozhi 用的也是这个）：每个消息放进一个 `LV_PCT(100)` 宽的**行容器**，
+ *   行容器自己是一个横向 flex，按角色取 `FLEX_ALIGN_END / START / CENTER`。
+ *   比"整宽行 + lv_obj_align"更一致 —— 全程只用 flex，不混两套定位机制。
+ *
+ * 【气泡宽度】按**实测文本宽度**自适应，上限屏宽 85%。
+ *   短消息不该撑满整行（那样看着像公告不像对话），长消息自动换行。
  * ========================================================================== */
-#define AI_PHOTO_W   320
-#define AI_PHOTO_H   240
-#define AI_BTN_H     32
+#define AI_CHAT_MAX_MSG   20      /* 最多保留的消息条数（与 xiaozhi MAX_MESSAGES 一致）*/
+#define AI_BTN_H          32
+#define AI_BAR_PAD        10      /* 操作栏内边距 */
+#define AI_BTN_W          ((TH_W - 2 * TH_MARGIN - 12) / 2)
 
-static lv_obj_t *s_ai_photo   = NULL;   /* lv_image：照片本体 */
-static lv_obj_t *s_ai_hint    = NULL;   /* 照片区中央的提示/状态文字 */
-static lv_obj_t *s_ai_btn     = NULL;
-static lv_obj_t *s_ai_btn_lbl = NULL;
+static lv_obj_t *s_chat_list  = NULL;   /* 聊天区（flex column，可滚动）*/
+static lv_obj_t *s_chat_photo = NULL;   /* 当前那张照片的 lv_image；同刻只留一张 */
+static lv_obj_t *s_cam_btn    = NULL;
+static lv_obj_t *s_cam_btn_lbl = NULL;
+static lv_obj_t *s_mic_btn    = NULL;
+static lv_obj_t *s_mic_btn_lbl = NULL;
+
+/* 麦克风按钮是否**正被按住**（P7 按键说话）。
+ *
+ * 【为什么是"按住状态"而不是"按下/松开两个请求"】
+ * 语音任务在 rec_read() 里一次阻塞 60ms，两次轮询之间可能跨过整个
+ * 按下-松开。请求式的标志会漏事件；而"当前是否按住"是**状态**，
+ * 只要轮询还存在就一定读得到正确值（最多晚 60ms）。
+ *
+ * ⚠️ 与 s_capture_req 同一条纪律：只在 LVGL 回调里**写**，
+ *    只在锁外**读**。读侧不碰 LVGL。 */
+static volatile bool s_talk_held = false;
 
 /* 拍照请求标志。
  * ⚠️ 只允许**置位**（在 LVGL 回调里）与**取走**（在 ui_task 锁外轮询），
@@ -233,97 +257,403 @@ bool ui_pages_take_capture_request(void)
     return true;
 }
 
-lv_obj_t *ui_pages_ai_photo(void)
+/* --------------------------------------------------------------------------
+ * 语音按钮（按键说话）
+ * -------------------------------------------------------------------------- */
+
+static void on_mic_pressed(lv_event_t *e)
 {
-    return s_ai_photo;
+    (void)e;
+    s_talk_held = true;
 }
 
-void ui_pages_ai_hint_visible(bool visible)
+static void on_mic_released(lv_event_t *e)
 {
-    if (s_ai_hint == NULL) {
+    /* RELEASED 与 PRESS_LOST 都走这里。
+       PRESS_LOST 是"按住时手指滑出按钮"—— 对用户来说等同于松手，
+       必须也置 false，否则会一直录下去。 */
+    (void)e;
+    s_talk_held = false;
+}
+
+bool ui_pages_talk_held(void)
+{
+    /* 纯读标志，不碰 LVGL —— 调用方可在任意任务、锁外调用 */
+    return s_talk_held;
+}
+
+void ui_pages_set_talk_ready(bool ready)
+{
+    if (s_mic_btn == NULL) {
         return;
     }
-    if (visible) {
-        lv_obj_remove_flag(s_ai_hint, LV_OBJ_FLAG_HIDDEN);
+    /* 与拍照按钮同一套做法：用 LVGL 的 DISABLED 状态而不是自己记标志 ——
+       处于该状态的对象不会再派发 PRESSED，所以"没连上就按不动"是天然成立的，
+       不需要在回调里再判一次。 */
+    if (ready) {
+        lv_obj_remove_state(s_mic_btn, LV_STATE_DISABLED);
     } else {
-        lv_obj_add_flag(s_ai_hint, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_state(s_mic_btn, LV_STATE_DISABLED);
+        s_talk_held = false;    /* 变成不可用的瞬间必须清掉，否则会卡在"一直按住" */
+    }
+    lv_obj_set_style_bg_opa(s_mic_btn, ready ? LV_OPA_COVER : LV_OPA_50, 0);
+
+    if (s_mic_btn_lbl != NULL) {
+        lv_label_set_text(s_mic_btn_lbl, ready ? "按住说话" : "语音（未连接）");
     }
 }
 
-void ui_pages_set_ai_status(const char *text, bool button_enabled)
+void ui_pages_set_talk_state(ui_talk_state_t st)
 {
-    if (s_ai_hint != NULL) {
-        if (text != NULL && text[0] != '\0') {
-            lv_label_set_text(s_ai_hint, text);
-            lv_obj_remove_flag(s_ai_hint, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(s_ai_hint, LV_OBJ_FLAG_HIDDEN);
-        }
+    if (s_mic_btn == NULL || s_mic_btn_lbl == NULL) {
+        return;
     }
 
-    if (s_ai_btn != NULL) {
-        /* 置灰但仍可见 —— 比直接隐藏更能说明"功能存在但不可用"。
-           用 LVGL 的 DISABLED 状态而不是自己记标志：处于该状态的对象
-           **不会**再派发 CLICKED，所以连点/拍摄中再点都不会进回调。
-           （若只改透明度而不设状态，回调照样触发，得在回调里再判一次。） */
-        if (button_enabled) {
-            lv_obj_remove_state(s_ai_btn, LV_STATE_DISABLED);
-        } else {
-            lv_obj_add_state(s_ai_btn, LV_STATE_DISABLED);
-        }
-        lv_obj_set_style_bg_opa(s_ai_btn, button_enabled ? LV_OPA_COVER : LV_OPA_50, 0);
-
-        if (s_ai_btn_lbl != NULL) {
-            lv_label_set_text(s_ai_btn_lbl, button_enabled ? "拍照" : "摄像头不可用");
-        }
+    /* 标签文字**留在界面层** —— 与其它页面文案一致，业务代码不该拼 UI 字符串。
+       配色只区分"是否正在进行中"：进行中用暖色，静默用主题强调色。 */
+    switch (st) {
+    case UI_TALK_LISTENING:
+        lv_label_set_text(s_mic_btn_lbl, "正在听…");
+        lv_obj_set_style_bg_color(s_mic_btn, lv_color_hex(TH_BUSY), 0);
+        break;
+    case UI_TALK_WORKING:
+        lv_label_set_text(s_mic_btn_lbl, "识别中…");
+        lv_obj_set_style_bg_color(s_mic_btn, lv_color_hex(TH_BUSY), 0);
+        break;
+    case UI_TALK_SPEAKING:
+        lv_label_set_text(s_mic_btn_lbl, "回复中…");
+        lv_obj_set_style_bg_color(s_mic_btn, lv_color_hex(TH_BUSY), 0);
+        break;
+    case UI_TALK_IDLE:
+    default:
+        /* 回到 IDLE 时按当前是否可用决定文案 —— 别覆盖掉"未连接" */
+        lv_label_set_text(s_mic_btn_lbl,
+                          lv_obj_has_state(s_mic_btn, LV_STATE_DISABLED)
+                              ? "语音（未连接）" : "按住说话");
+        lv_obj_set_style_bg_color(s_mic_btn, lv_color_hex(TH_ACCENT), 0);
+        break;
     }
 }
 
+/* --------------------------------------------------------------------------
+ * 内部小工具
+ * -------------------------------------------------------------------------- */
+
+/** 多行文本里**最宽一行**的像素宽度。
+ *
+ *  为什么逐行量而不是整串量：`lv_text_get_width()` 会把 '\n' 也算进宽度，
+ *  多行消息会因此偏宽、气泡留出多余的右边距。逐行取最大值更贴合内容。
+ *  （xiaozhi 是整串量的 —— 它那边偏宽一点看不出来。这里顺手做对。） */
+static lv_coord_t chat_text_width(const char *text, const lv_font_t *font)
+{
+    lv_coord_t max_w = 0;
+    const char *p = text;
+
+    while (p != NULL && *p != '\0') {
+        const char *nl = strchr(p, '\n');
+        const size_t len = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
+        if (len > 0) {
+            const lv_coord_t w = lv_text_get_width(p, (uint32_t)len, font, 0);
+            if (w > max_w) {
+                max_w = w;
+            }
+        }
+        p = (nl != NULL) ? (nl + 1) : NULL;
+    }
+    return max_w;
+}
+
+/** 删掉最早的消息，直到条数低于上限。
+ *  上限存在的理由：控件数无限增长会让每帧的布局遍历变慢（本工程是单缓冲
+ *  部分刷新，控件越多重绘代价越大）。 */
+static void chat_trim(void)
+{
+    /* ⚠️ s_chat_list 的直接子对象是**行容器**，不是气泡 —— 见文件头的说明。 */
+    while (lv_obj_get_child_count(s_chat_list) >= AI_CHAT_MAX_MSG) {
+        lv_obj_t *row = lv_obj_get_child(s_chat_list, 0);
+        if (row == NULL) {
+            break;
+        }
+        /* 被删的这行可能就是照片所在行 —— 指针要跟着清，
+           否则后面 ui_pages_chat_add_photo() 会对已删除对象操作。 */
+        if (s_chat_photo != NULL && lv_obj_get_parent(s_chat_photo) == row) {
+            s_chat_photo = NULL;
+        }
+        lv_obj_del(row);
+    }
+}
+
+/** 建一个整宽行容器，内部按 main_align 横向对齐。
+ *
+ *  ⚠️ **不调 `lv_obj_remove_style_all()`** —— 照 xiaozhi 的写法：
+ *  只覆盖需要改的样式（背景透明、无边框、无内边距），其余保留主题默认值。
+ *  默认值里有 `width/height = LV_SIZE_CONTENT` 这类关键项，全抹掉会让
+ *  尺寸解析失去起点。 */
+static lv_obj_t *chat_make_row(lv_flex_align_t main_align)
+{
+    lv_obj_t *row = lv_obj_create(s_chat_list);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, main_align,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    return row;
+}
+
+/** 滚到底。先强制布局一次，否则刚加进去的行还没有尺寸，滚不到底。 */
+static void chat_scroll_to_bottom(void)
+{
+    lv_obj_update_layout(s_chat_list);
+    lv_obj_scroll_to_y(s_chat_list, LV_COORD_MAX, LV_ANIM_OFF);
+}
+
+/* --------------------------------------------------------------------------
+ * 追加消息
+ * -------------------------------------------------------------------------- */
+void ui_pages_chat_add(ui_chat_role_t role, const char *text)
+{
+    if (s_chat_list == NULL || text == NULL || text[0] == '\0') {
+        return;
+    }
+
+    /* ---- 系统消息折叠（照搬 xiaozhi :533-548）----
+       连续多条系统消息时**删掉上一条**而不是追加 —— 系统消息是状态提示，
+       堆一屏会淹没真正的对话内容。 */
+    const uint32_t n_child = lv_obj_get_child_count(s_chat_list);
+    if (role == UI_CHAT_SYSTEM && n_child > 0) {
+        lv_obj_t *last = lv_obj_get_child(s_chat_list, (int32_t)n_child - 1);
+        if (last != NULL && lv_obj_get_child_count(last) > 0) {
+            lv_obj_t *last_bubble = lv_obj_get_child(last, 0);
+            if (last_bubble != NULL &&
+                lv_obj_get_user_data(last_bubble) == (void *)(intptr_t)UI_CHAT_SYSTEM) {
+                lv_obj_del(last);
+            }
+        }
+    }
+
+    chat_trim();
+
+    /* 行容器：整宽透明 —— 照搬 xiaozhi 的做法（:640-677）。
+       用户/系统气泡要靠它做右对齐/居中；助手气泡直接挂 chat_list（靠列的
+       cross-align START 自然左对齐），xiaozhi 也是这样分两种放法的。 */
+    lv_obj_t *row = chat_make_row(
+        (role == UI_CHAT_USER)   ? LV_FLEX_ALIGN_END
+      : (role == UI_CHAT_SYSTEM) ? LV_FLEX_ALIGN_CENTER
+      :                            LV_FLEX_ALIGN_START);
+
+    /* ---- 气泡本体 ----
+       ⚠️ **不要**对气泡调 lv_obj_remove_style_all()！
+       那是本工程其它页面（卡片等）的惯例，但会连默认的
+       width/height = LV_SIZE_CONTENT 一起抹掉，使尺寸解析失去起点 ——
+       表现就是"文字与气泡对不上""图片只显示一半"。xiaozhi 的气泡是
+       "只改需要的样式、保留主题默认值"，这里照它写。 */
+    lv_obj_t *bubble = lv_obj_create(row);
+    lv_obj_set_style_radius(bubble, TH_CHAT_RADIUS, 0);
+    lv_obj_set_style_pad_all(bubble, TH_CHAT_PAD, 0);
+    lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(bubble, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_flex_grow(bubble, 0, 0);
+    lv_obj_set_user_data(bubble, (void *)(intptr_t)role);
+
+    lv_obj_t *label = lv_label_create(bubble);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_line_space(label, 6, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+
+    /* 宽度按**实测文本宽度**自适应，上限屏宽 85%（照搬 xiaozhi :563-580）。
+       ⚠️ 气泡宽要**留出内边距**（+2×pad）—— xiaozhi 那边把气泡设成与文字同宽，
+       而气泡有 8px padding，文字实际比可用区宽 16px，会被挤着换行。
+       这里补上这 16px，是本实现对参考的唯一修正。 */
+    lv_coord_t w = chat_text_width(text, &font_puhui_16_4);
+    if (w < 20)            { w = 20; }
+    if (w > TH_CHAT_MAX_W) { w = TH_CHAT_MAX_W; }
+    lv_obj_set_width(label, w);
+    lv_obj_set_width(bubble, w + 2 * TH_CHAT_PAD);
+    lv_obj_set_height(bubble, LV_SIZE_CONTENT);
+
+    switch (role) {
+    case UI_CHAT_USER:
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(TH_BUBBLE_USER), 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(TH_TEXT), 0);
+        break;
+    case UI_CHAT_ASSISTANT:
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(TH_BUBBLE_AI), 0);
+        lv_obj_set_style_border_color(bubble, lv_color_hex(TH_EDGE), 0);
+        lv_obj_set_style_border_width(bubble, 1, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(TH_TEXT), 0);
+        break;
+    default:    /* UI_CHAT_SYSTEM */
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(TH_BUBBLE_SYS), 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(TH_TEXT_SYS), 0);
+        break;
+    }
+
+    chat_scroll_to_bottom();
+}
+
+void ui_pages_chat_add_photo(const lv_image_dsc_t *dsc)
+{
+    if (s_chat_list == NULL || dsc == NULL ||
+        dsc->header.w == 0 || dsc->header.h == 0) {
+        return;
+    }
+
+    /* ---- 同一时刻只留一张照片：先删旧的整行 ----
+       原因见 ui_pages.h —— 照片缓冲只有两块，留多了会互相覆盖。 */
+    if (s_chat_photo != NULL) {
+        lv_obj_t *old_row = lv_obj_get_parent(s_chat_photo);
+        lv_obj_del((old_row != NULL) ? old_row : s_chat_photo);
+        s_chat_photo = NULL;
+    }
+
+    chat_trim();
+
+    /* ---- 缩放因子（照搬 xiaozhi `SetPreviewImage()` :744-760）----
+       图片限制在 **屏宽70% × 屏高50%** 之内。
+       为什么必须缩放而不能 1:1 直显：QVGA 图是 320×240，而聊天区只有
+       480 × (320-44-52) = 480×224 —— **1:1 根本放不下，会被裁掉一半**。
+
+       LVGL 的缩放单位是 1/256（256 = 100%）；取宽高两个限制里更小的那个，
+       保证整图都装得下；图本来就比限制小时不放大（钳到 256）。
+       缩放开销：LVGL 只在对象标脏时重算，静态气泡不会每帧重绘，可接受。 */
+    const lv_coord_t max_w = TH_W * 70 / 100;
+    const lv_coord_t max_h = TH_H * 50 / 100;
+    const lv_coord_t img_w = (lv_coord_t)dsc->header.w;
+    const lv_coord_t img_h = (lv_coord_t)dsc->header.h;
+
+    lv_coord_t zoom_w = (max_w * 256) / img_w;
+    lv_coord_t zoom_h = (max_h * 256) / img_h;
+    lv_coord_t zoom   = (zoom_w < zoom_h) ? zoom_w : zoom_h;
+    if (zoom > 256) {
+        zoom = 256;
+    }
+
+    const lv_coord_t sw = (img_w * zoom) / 256;
+    const lv_coord_t sh = (img_h * zoom) / 256;
+
+    /* 照片与助手消息一样左对齐、白底 —— 它是"给你看的东西"，
+       不是用户自己说的话。xiaozhi 的 img_bubble 也是这么摆的。 */
+    lv_obj_t *row = chat_make_row(LV_FLEX_ALIGN_START);
+
+    lv_obj_t *bubble = lv_obj_create(row);
+    lv_obj_set_style_radius(bubble, TH_CHAT_RADIUS, 0);
+    lv_obj_set_style_pad_all(bubble, TH_CHAT_PAD, 0);
+    lv_obj_set_style_bg_color(bubble, lv_color_hex(TH_BUBBLE_AI), 0);
+    lv_obj_set_style_bg_opa(bubble, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(bubble, lv_color_hex(TH_EDGE), 0);
+    lv_obj_set_style_border_width(bubble, 1, 0);
+    lv_obj_set_scrollbar_mode(bubble, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_style_flex_grow(bubble, 0, 0);
+
+    /* ⚠️ 气泡尺寸**必须显式给**：`lv_image_set_scale()` 只改**绘制**缩放，
+       不改对象自身尺寸（对象尺寸仍是源的 w×h）。所以是按缩放后的尺寸
+       加内边距来定气泡大小 —— 与 xiaozhi 的 `scaled_width + 16` 同款。 */
+    lv_obj_set_size(bubble, sw + 2 * TH_CHAT_PAD, sh + 2 * TH_CHAT_PAD);
+
+    s_chat_photo = lv_image_create(bubble);
+    lv_image_set_src(s_chat_photo, dsc);
+    lv_image_set_scale(s_chat_photo, zoom);
+    lv_obj_center(s_chat_photo);
+
+    chat_scroll_to_bottom();
+}
+
+void ui_pages_set_camera_ready(bool ready)
+{
+    if (s_cam_btn == NULL) {
+        return;
+    }
+    /* 置灰但仍可见 —— 比直接隐藏更能说明"功能存在但不可用"。
+       用 LVGL 的 DISABLED 状态而不是自己记标志：处于该状态的对象
+       **不会**再派发 CLICKED，所以连点/拍摄中再点都不会进回调。 */
+    if (ready) {
+        lv_obj_remove_state(s_cam_btn, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(s_cam_btn, LV_STATE_DISABLED);
+    }
+    lv_obj_set_style_bg_opa(s_cam_btn, ready ? LV_OPA_COVER : LV_OPA_50, 0);
+
+    if (s_cam_btn_lbl != NULL) {
+        lv_label_set_text(s_cam_btn_lbl, ready ? "拍照" : "摄像头不可用");
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * 建页
+ * -------------------------------------------------------------------------- */
 static void build_ai_page(lv_obj_t *root)
 {
     lv_obj_t *content = ui_page_make_shell(root, "小智AI互动", true);
 
-    /* ---- 照片区外框：即使还没拍过照，也能看出"这里会出画面" ---- */
-    lv_obj_t *frame = lv_obj_create(content);
-    lv_obj_remove_style_all(frame);
-    lv_obj_remove_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(frame, (TH_W - AI_PHOTO_W) / 2, 0);
-    lv_obj_set_size(frame, AI_PHOTO_W, AI_PHOTO_H);
-    lv_obj_set_style_bg_color(frame, lv_color_hex(TH_CARD), 0);
-    lv_obj_set_style_bg_opa(frame, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(frame, lv_color_hex(TH_EDGE), 0);
-    lv_obj_set_style_border_width(frame, 1, 0);
+    /* ---- 聊天区：纵向 flex + 滚动 ---- */
+    s_chat_list = lv_obj_create(content);
+    lv_obj_remove_style_all(s_chat_list);
+    lv_obj_set_pos(s_chat_list, 0, 0);
+    lv_obj_set_size(s_chat_list, TH_W, TH_H - TH_HEADER_H - TH_CHAT_BAR_H);
+    lv_obj_set_style_bg_color(s_chat_list, lv_color_hex(TH_CHAT_BG), 0);
+    lv_obj_set_style_bg_opa(s_chat_list, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s_chat_list, 8, 0);
+    lv_obj_set_style_pad_row(s_chat_list, TH_CHAT_GAP_Y, 0);
+    lv_obj_set_scrollbar_mode(s_chat_list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_dir(s_chat_list, LV_DIR_VER);
+    lv_obj_set_flex_flow(s_chat_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_chat_list, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    /* 照片控件：尺寸与 source 一致（320×240），故定位于 (0,0) 即可铺满 */
-    s_ai_photo = lv_image_create(frame);
-    lv_obj_set_pos(s_ai_photo, 0, 0);
+    /* ---- 底部操作栏 ---- */
+    lv_obj_t *bar = lv_obj_create(content);
+    lv_obj_remove_style_all(bar);
+    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(bar, 0, TH_H - TH_HEADER_H - TH_CHAT_BAR_H);
+    lv_obj_set_size(bar, TH_W, TH_CHAT_BAR_H);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(TH_CARD), 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
 
-    /* 中央提示 / 状态文字。多行 + 居中。 */
-    s_ai_hint = lv_label_create(frame);
-    lv_label_set_text(s_ai_hint, "点下方按钮拍照");
-    lv_obj_set_style_text_font(s_ai_hint, &font_puhui_16_4, 0);
-    lv_obj_set_style_text_color(s_ai_hint, lv_color_hex(TH_LABEL), 0);
-    lv_obj_set_style_text_align(s_ai_hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(s_ai_hint, AI_PHOTO_W - 24);
-    lv_label_set_long_mode(s_ai_hint, LV_LABEL_LONG_WRAP);
-    lv_obj_center(s_ai_hint);
+    /* 拍照（左） */
+    s_cam_btn = lv_obj_create(bar);
+    lv_obj_remove_style_all(s_cam_btn);
+    lv_obj_remove_flag(s_cam_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_cam_btn, TH_MARGIN, AI_BAR_PAD);
+    lv_obj_set_size(s_cam_btn, AI_BTN_W, AI_BTN_H);
+    lv_obj_set_style_bg_color(s_cam_btn, lv_color_hex(TH_ACCENT), 0);
+    lv_obj_set_style_bg_opa(s_cam_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_cam_btn, 8, 0);
+    lv_obj_add_event_cb(s_cam_btn, on_capture_clicked, LV_EVENT_CLICKED, NULL);
 
-    /* ---- 底部拍照按钮（整宽）---- */
-    s_ai_btn = lv_obj_create(content);
-    lv_obj_remove_style_all(s_ai_btn);
-    lv_obj_remove_flag(s_ai_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_ai_btn, TH_MARGIN, AI_PHOTO_H + 2);
-    lv_obj_set_size(s_ai_btn, TH_W - 2 * TH_MARGIN, AI_BTN_H);
-    lv_obj_set_style_bg_color(s_ai_btn, lv_color_hex(TH_ACCENT), 0);
-    lv_obj_set_style_bg_opa(s_ai_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_ai_btn, 8, 0);
-    lv_obj_add_event_cb(s_ai_btn, on_capture_clicked, LV_EVENT_CLICKED, NULL);
+    s_cam_btn_lbl = lv_label_create(s_cam_btn);
+    lv_label_set_text(s_cam_btn_lbl, "拍照");
+    lv_obj_set_style_text_font(s_cam_btn_lbl, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_cam_btn_lbl, lv_color_hex(TH_CARD), 0);
+    lv_obj_center(s_cam_btn_lbl);
 
-    s_ai_btn_lbl = lv_label_create(s_ai_btn);
-    lv_label_set_text(s_ai_btn_lbl, "拍照");
-    lv_obj_set_style_text_font(s_ai_btn_lbl, &font_puhui_16_4, 0);
-    lv_obj_set_style_text_color(s_ai_btn_lbl, lv_color_hex(TH_CARD), 0);
-    lv_obj_center(s_ai_btn_lbl);
+    /* 语音（右）—— P7 按键说话。
+       按住 = 开始录并上行；松开 = 停止上行，等服务器回复。
+       选"按住说话"而不是"点一下开始、再点一下结束"，是因为前者
+       松手即停，用户不需要记住"现在是不是在录"这个状态。 */
+    s_mic_btn = lv_obj_create(bar);
+    lv_obj_remove_style_all(s_mic_btn);
+    lv_obj_remove_flag(s_mic_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_mic_btn, TH_MARGIN + AI_BTN_W + 12, AI_BAR_PAD);
+    lv_obj_set_size(s_mic_btn, AI_BTN_W, AI_BTN_H);
+    lv_obj_set_style_bg_color(s_mic_btn, lv_color_hex(TH_ACCENT), 0);
+    lv_obj_set_style_bg_opa(s_mic_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_mic_btn, 8, 0);
+    /* 初始不可用，等 xz_client 连上服务器后由 ui_lvgl_set_talk_ready(true) 打开 */
+    lv_obj_add_state(s_mic_btn, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(s_mic_btn, on_mic_pressed,   LV_EVENT_PRESSED,    NULL);
+    lv_obj_add_event_cb(s_mic_btn, on_mic_released,  LV_EVENT_RELEASED,   NULL);
+    lv_obj_add_event_cb(s_mic_btn, on_mic_released,  LV_EVENT_PRESS_LOST, NULL);
+
+    s_mic_btn_lbl = lv_label_create(s_mic_btn);
+    lv_label_set_text(s_mic_btn_lbl, "语音（未连接）");
+    lv_obj_set_style_text_font(s_mic_btn_lbl, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_mic_btn_lbl, lv_color_hex(TH_CARD), 0);
+    lv_obj_center(s_mic_btn_lbl);
 }
 
 /* ==========================================================================

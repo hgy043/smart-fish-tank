@@ -97,8 +97,7 @@ CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=n
 # ---------------------------------------------------------------------------
 CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_WIFI_NVS_ENABLED=y
-# 巴法云走明文 TCP 9501，不需要 TLS；如需 9503 加密端口再打开
-CONFIG_MQTT_PROTOCOL_311=y
+# 巴法云走明文 TCP 9501，不需要 TLS；如需 9503 加密端口再打开。CONFIG_MQTT_PROTOCOL_311=y
 CONFIG_MQTT_TRANSPORT_SSL=n
 CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
 # lwIP socket 数：MQTT + 后续 HTTP(AI/OTA) + DNS 并发，默认 10 偏紧
@@ -177,4 +176,71 @@ CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y
 # 8KB 是 xiaozhi 在同一块板上的取值，属已验证值，不是猜的。
 # 若日后画面撕裂/丢帧，可往上调，但要盯住 monitor_task 的内部堆余量（≥30%）。
 CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=8192
+
+# ============================================================================
+# TLS 缓冲（P7 语音对话）—— **与 xiaozhi 逐项对齐**
+# ============================================================================
+# 【为什么必须开这个】
+# 小智的 wss 连接是**常驻**的（一开机就连上，一直挂着等对话）。
+# mbedtls 默认会为每条连接**常驻**分配 in/out 两个内容缓冲：
+#     16384 (in) + 4096 (out) = 20 KB 内部 RAM
+# 而这条连接 99% 的时间在空闲 —— 那 20KB 白占着。
+#
+# `MBEDTLS_DYNAMIC_BUFFER=y` 让这两个缓冲**按需分配、用完释放**。
+# 实测对比：不开时内部堆余量掉到 15%，开了之后应有明显回升。
+#
+# ⚠️ xiaozhi 也开了这一项（其 sdkconfig:2055），我们没有 —— 这正是差距所在。
+#    这类"参考工程开了、我们没开"的配置项是最难凭空想到的，
+#    只能靠逐项对比 sdkconfig 发现。
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# 下面两项两工程一致（xiaozhi sdkconfig:2052-2054），列出来是为了标明
+# "这里被核对过"，不是我们需要改的：
+#   CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y   (默认)
+#   CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+#   CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# ============================================================================
+# 内部 RAM 瘦身（P7）—— 逐项对比 xiaozhi 的 sdkconfig 得出
+# ============================================================================
+# 【背景】接入常驻 wss 连接后，内部堆余量掉到 15%；开了上面的
+# MBEDTLS_DYNAMIC_BUFFER 回到 22%，仍低于 30% 验收线。下面三项继续回收。
+# 取值全部来自 xiaozhi（它在同款板上跑同样的协议栈），不是自己拍的。
+
+# 16KB → 4KB → **512**。它的含义是"小于该值的 malloc 一律优先占内部 RAM"。
+# 原来是 16384，于是 lwip 的 TCP 收发缓冲（各 5760 字节）、TLS 内容缓冲
+# 这些**本来可以放 PSRAM** 的分配全挤在内部 RAM 里。
+# 2026-10-13 先降到 4096（当时内部堆 22%→25%），本次再降到 **512** 与
+# xiaozhi 完全一致 —— 起因是接入语音对话后内部堆跌到 16%，
+# 且已实测到"一说话就整机复位"（websocket_task 爆栈）。
+# **这不是调优，是照搬参考值的第三步**，前两步（TLS 动态缓冲、WiFi 缓冲数）
+# 都在 sdkconfig.defaults 里各有记录。
+# ⚠️ DMA 缓冲不受影响：它们用显式 MALLOC_CAP_DMA/INTERNAL 申请（LVGL 绘制缓冲、
+#    摄像头 DMA 都是），不会被这条规则挪到 PSRAM。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
+
+# Wi-Fi 静态 RX 缓冲 10 → 6。每个 1600 字节，直接省 6.4KB 内部 RAM。
+# xiaozhi 用 6，我们没有理由比它多。
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+
+# Wi-Fi 动态 RX 缓冲上限 32 → 8。这是**上限**（按需分配），
+# 但驱动启动时就会按它预分配一部分。xiaozhi 用 8。
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+
+# Wi-Fi 代码放 IRAM 的优化：**关掉**。
+#
+# 【为什么这是关键一项】ESP32-S3 的 IRAM 与 DRAM **共享同一块物理 SRAM** ——
+# 把 Wi-Fi 代码搬进 IRAM，就等于从内部堆里挖走同样多的字节。
+# 这两项 IDF 默认是开的，而 **xiaozhi 显式关掉了**，这正是它能塞下
+# 常驻 wss + 语音栈的原因。
+#
+# 代价：Wi-Fi 吞吐与延迟会略降（代码改从 flash 取）。本工程的网络负载很轻
+# （10 秒一次 MQTT 上报 + 语音流），这点代价换回几十 KB 内部 RAM 完全值得。
+# 判据：若出现明显的网络卡顿或丢包，再逐项打开定位。
+#
+# 启动日志里 `wifi_init: WiFi IRAM OP enabled` 那两行会消失 —— 那就是生效的证据。
+# CONFIG_ESP_WIFI_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+
+
 

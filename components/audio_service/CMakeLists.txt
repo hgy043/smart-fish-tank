@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS        "audio_service.c"
     INCLUDE_DIRS "include"
-    REQUIRES     board_gec esp_driver_i2s esp_driver_gpio espressif__esp_codec_dev
+    REQUIRES     board_gec esp_driver_i2s esp_driver_gpio esp_timer espressif__esp_codec_dev
 )
 
 # ============================================================================
