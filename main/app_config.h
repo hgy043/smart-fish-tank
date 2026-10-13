@@ -80,7 +80,32 @@ extern "C" {
  * 缓冲区（放在 PSRAM 的大块内存）
  * ========================================================================== */
 #define CAMERA_FB_IN_PSRAM          1
-#define LVGL_BUFFER_IN_PSRAM        1
+
+/* ⚠️ LVGL 绘制缓冲 **不放 PSRAM**，故本宏为 0。
+ *
+ * 它此前被预设为 1 且全工程无人引用，方向是错的。理由见 architecture.md 7.4：
+ * IDF 的 SPI 驱动在源缓冲位于 PSRAM 时，会在**每次事务**于内部 RAM 分配一块
+ * 等长缓冲并 memcpy（spi_master.c 的 setup_dma_priv_buffer），而这段代码运行在
+ * SPI 中断路径上。代价是反复 malloc/free + ISR 内拷贝，且内部 RAM 只有约 361KB。
+ *
+ * LVGL 的绘制缓冲属于 **DMA 源缓冲**，与摄像头的帧缓冲性质不同 ——
+ * 后者不直接做 SPI DMA 源，放 PSRAM 是对的，故 CAMERA_FB_IN_PSRAM 保持 1。
+ * PSRAM 将来适合放 LVGL 的**图片资源**（PNG 解码帧等），不适合放 DMA 源缓冲。 */
+#define LVGL_BUFFER_IN_PSRAM        0
+
+/* 注：LVGL / 界面相关的可调参数（渲染任务优先级与栈、tick 周期、绘制缓冲行数、
+ * 取锁超时等）**不放在本文件**，而在
+ * `components/ui_lvgl/include/ui_lvgl_config.h`。
+ *
+ * 原因：本文件属于 `main` 组件，而 ESP-IDF 不允许其它组件依赖 `main`
+ * （会形成循环依赖）。工程内既有约定也是「组件的可调参数放组件自己的头文件」，
+ * 参见 `components/net_service/include/wifi_sta.h` 里的 APP_WIFI_BACKOFF_* 。
+ *
+ * 本文件只保留 main 自己（app_main.c / ui_task）需要的那几个。 */
+
+/* ui_task 每轮向 LVGL 提交数据的节流周期。ui_task 本身按
+ * APP_UI_REFRESH_PERIOD_MS(30ms) 跑，但界面数据不需要这么快。 */
+#define APP_UI_DATA_PERIOD_MS       200
 
 /* ==========================================================================
  * 存储与队列
@@ -100,8 +125,11 @@ extern "C" {
  * C1 已作废（见下），故该模式开关一并删除，避免留下无人引用的死配置。
  * 若日后确实需要「只跑 LCD、不碰音频」的隔离测试，直接关 P05_TEST_AUDIO 即可。 */
 
-/* 音频重复播放测试（验证"只响一次"已修）。真因与修法见 architecture.md 7.2。 */
-#define P05_TEST_AUDIO              1
+/* 音频重复播放测试（验证"只响一次"已修）。真因与修法见 architecture.md 7.2。
+ * **P2 起默认关闭**：它要占约 6 秒开机时间并在每次上电都发声。
+ * 它与 LVGL 没有技术冲突（跑在任务创建之前），纯粹是省启动时间；
+ * 需要复核喇叭时置 1。 */
+#define P05_TEST_AUDIO              0
 
 /* 音频 / LCD **初始化顺序对照试验** —— **默认关闭**。
  * 设计目的：判定「喇叭无声」是否由 LCD 占用 I2S 引脚引起。
@@ -110,8 +138,22 @@ extern "C" {
  * 代码保留，供日后怀疑引脚冲突时直接复用。 */
 #define P05_TEST_AUDIO_LCD_ORDER    0
 
-/* 上电即点亮 LCD 并画彩条（验证 SPI 通路、方向、颜色通道） */
-#define P05_TEST_LCD                1
+/* LCD 上电初始化（lcd_init + 点亮背光 + 打印引脚快照）。
+ *
+ * ⚠️ **P2 起这是必需步骤，不要关**：lcd_init() 在这个块里，而
+ *    ui_task 里的 ui_lvgl_init() 要求 lcd_is_ready() 为真。
+ *    下面的绘制自检可以关，初始化不行。 */
+#define P05_LCD_INIT                1
+
+/* LCD 绘制自检（彩条 + 八色探针 + 方向枚举）。
+ *
+ * **P2 起默认关闭**，原因有两条：
+ *   ① 它跑在 app_main 上下文直接刷屏，与 ui_task 里的 LVGL 同屏混画会交错
+ *      发 SPI 事务，导致窗口/数据错配 —— 也违反「绘制只在 ui_task 内」的边界；
+ *   ② 它要占用十余秒开机时间。
+ *
+ * 需要复核颜色/方向/背光时置 1 即可复现（三个子试验各自的开关见下）。 */
+#define P05_TEST_LCD_DRAW           0
 
 /* 方向(8) × 背光极性(2) 枚举试验 —— **已裁决，默认关闭**（2026-10-13）。
  *   方向：彩条能被逐条读出 ⇒ MV|MX|MY 正确（MADCTL 终值 0xE0）
@@ -128,7 +170,7 @@ extern "C" {
  *
  * 此时不能再靠彩条推：彩条的结论依赖「左→右」这一人为读数顺序，报错一位
  * 就会把结论带偏（本项目多次栽在未受控的观测上）。全屏单色去掉了这个隐患。 */
-#define P05_TEST_LCD_COLOR_PROBE    1
+#define P05_TEST_LCD_COLOR_PROBE    0
 
 /* ---- 已裁决完毕、相关代码已删除的试验（结论保留在此，避免重蹈）----
  *

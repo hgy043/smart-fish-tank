@@ -67,8 +67,9 @@ static const char *TAG = "lcd";
 
 /* MADCTL 的颜色顺序位。**必须与 lcd_init() 里 panel_config.rgb_ele_order
    保持一致**，否则方向枚举试验跑完会把颜色顺序改回去。
-   实测裁决：本面板为 RGB 顺序 ⇒ 0x00（BGR 位不置位，判据见 lcd_init 内注释）。 */
-#define LCD_MADCTL_BGR_BIT  0x00
+   2026-10-13 定案：本面板为 **BGR** ⇒ 0x08（与两套厂家参考一致，
+   并已由自标注色卡逐格验证）。 */
+#define LCD_MADCTL_BGR_BIT  0x08
 
 /* ---- 像素时钟 ----------------------------------------------------------
  * 【2026-10-13 单变量对照：40 → 80 MHz】
@@ -130,43 +131,123 @@ static bool                      s_ready    = false;
 static int                       s_cs_gpio  = -1;
 
 /* ==========================================================================
- * 面板字段重排（本项目唯一的颜色编码入口）
+ * 绘制完成钩子（P2 新增，供 LVGL 端口使用）
  *
- * 【实测结论 — 2026-10-13，一轮 2×5 矩阵 + 一轮单位位探针】
+ * 【为什么必须有这个钩子】
+ * LVGL 单缓冲部分刷新模式下，**必须**等 DMA 真正读完这块缓冲才能复用它。
+ * LVGL 源码原文（lv_refr.c:851-854）：
+ *     "In single buffered mode wait here until the buffer is freed.
+ *      Else we would draw into the buffer while it's still being
+ *      transferred to the display"
+ * 它靠一个 flushing 标志来等 —— lv_display_flush_ready() 的实现就是
+ * `disp->flushing = 0;`（lv_display.c:609-612）。
  *
- * 这颗面板的控制器**不按 RGB565 标准排字段**，实测路由为：
- *     F0 [15:11] (5 位) → 红
- *     F1 [10:5]  (6 位) → 蓝
- *     F2 [4:0]   (5 位) → 绿
- * 即字段顺序是 **R, B, G**，而标准 RGB565 是 R, G, B。
+ * ⇒ **完成信号只能来自 DMA 完成中断，绝不能在 flush 回调里提前给。**
+ *   提前给会让 LVGL 立刻把下一条带画进 DMA 正在读的同一块缓冲，
+ *   表现为随机的花屏/撕裂。
  *
- * 判据：
- *   - 0x07E0（只有 [10:5] 置位）显示**蓝**  ⇒ 该 6 位字段归蓝，不是绿；
- *   - 0x0020（bit5）显示**蓝**               ⇒ bit5 属于蓝字段；（这一条
- *     直接否定了「蓝色只有 5 位、绿占 [5:0]」的替代模型）
- *   - 0x001F（只有 [4:0] 置位）显示**绿**     ⇒ 该 5 位字段归绿。
+ * 【本组件承担的角色】
+ * 持有 panel IO 的 on_color_trans_done，并转达给注册者（LVGL 的 flush_ready
+ * 就接在这上面）。这样 LVGL 侧不需要拿到 panel 句柄 —— 本组件继续把
+ * 「面板句柄」和「非标准色序」这两件事封在内部。
  *
- * **MADCTL 修不好它**：bit3 只交换 F0/F1 的去向（屏幕上表现为红蓝互换），
- * 管不到「6 位字段归绿还是归蓝」。所以必须在送数据前重排字段。
- *
- * 【为什么 b 左移 6 而不是 5】
- * 蓝色是 **6 位**通道，而复用 5 位的 b。若 b 低位对齐（b<<5），蓝最多只能到
- * 半亮度；必须**高位对齐**（b<<6，F1 的 bit5 恒为 0），蓝才占满量程。
- * 绿是 6 位数据塞进 5 位字段，只能丢最低位（g>>1），这是本面板的硬限制。
- *
- * 【已知存疑的一点】
- * 单位位探针里 0x0010(bit4) 报的是蓝，按本模型应为绿 —— 4 个点位中错 1 个，
- * 疑为读数时串步（该步前后两次都是蓝）。**不影响本公式**：本公式已对
- * 红/绿/蓝/黄/青/品红/白/黑 八个标准色逐一验算通过。
+ * ⚠️ panel IO 上该回调**只有一个槽**，注册即整体覆盖（IDF 会打
+ *    "already set and now it was overwritten!" 警告），没有链式回调。
+ *    本工程内只有本文件注册它，不存在竞争者。
  * ========================================================================== */
-static inline uint16_t panel_encode(uint16_t rgb565)
-{
-    const uint16_t r = (uint16_t)((rgb565 >> 11) & 0x1F);
-    const uint16_t g = (uint16_t)((rgb565 >>  5) & 0x3F);
-    const uint16_t b = (uint16_t)( rgb565        & 0x1F);
+static lcd_flush_done_cb_t s_flush_done_cb  = NULL;
+static void               *s_flush_done_ctx = NULL;
 
-    return (uint16_t)((r << 11) | (b << 6) | (g >> 1));
+/** panel IO 的色彩数据发送完成回调（**SPI 中断上下文**）。
+ *  SPI 分支下 edata 恒为 NULL（IDF 定义如此，见 esp_lcd_panel_io_spi.c）。
+ *  这里只做一件事：把事件转达给注册者。**不得**日志/阻塞/分配内存。 */
+static bool lcd_on_color_trans_done(esp_lcd_panel_io_handle_t io,
+                                    esp_lcd_panel_io_event_data_t *edata,
+                                    void *user_ctx)
+{
+    (void)io;
+    (void)edata;
+    (void)user_ctx;
+
+    if (s_flush_done_cb != NULL) {
+        s_flush_done_cb(s_flush_done_ctx);
+    }
+    return false;   /* 无需唤醒被阻塞的高优先级任务 */
 }
+
+void lcd_set_flush_done_cb(lcd_flush_done_cb_t cb, void *user)
+{
+    s_flush_done_cb  = cb;
+    s_flush_done_ctx = user;
+
+    if (s_panel_io != NULL) {
+        /* 已初始化 → 立即接线，支持「先 lcd_init 后注册」的顺序。
+           注：lcd_init() 自己也注册同一个函数，故 lcd_reinit() 重建 panel IO
+           后钩子自动继续有效，调用方无需重新注册。 */
+        const esp_lcd_panel_io_callbacks_t cbs = {
+            .on_color_trans_done = lcd_on_color_trans_done,
+        };
+        (void)esp_lcd_panel_io_register_event_callbacks(s_panel_io, &cbs, NULL);
+    }
+}
+
+/* ==========================================================================
+ * 【已废除】panel_encode() —— 此处曾有一个「面板字段重排」函数，2026-10-13 删除
+ *
+ * 原函数声称：这颗面板的控制器不按 RGB565 标准排字段，实际路由为
+ * R,B,G（[15:11]→红、[10:5]→蓝(6位)、[4:0]→绿(5位)），故送数据前必须重排：
+ *
+ *     return (r << 11) | (b << 6) | (g >> 1);
+ *
+ * ── 为什么它是错的 ──────────────────────────────────────────────────────
+ *
+ * 把那个式子展开，就能看出它实际做的事：**把三个字段整体错位了 1 个比特**。
+ *     r → [15:11]    （正确）
+ *     b → [10:6]     （标准是 [4:0]）
+ *     g → [ 5:1]     （标准是 [10:5]）
+ * 也就是说，它假设面板要的是 R5 B6 G5，而面板要的是标准的 R5 G6 B5。
+ *
+ * ── 用户实测如何反推出面板其实是标准的 ──────────────────────────────────
+ *
+ * 现象：彩条「红|绿|蓝|白|黑」显示成「红|蓝|绿|白|黑」。
+ * 反推路由（已知编码把 R 放 [15:11]、B 放 [10:6]、G 放 [5:1]）：
+ *     红输入 → [15:11] 全亮 → 显示红 ⇒ [15:11] → 红
+ *     蓝输入 → [10:6] 全亮  → 显示绿 ⇒ [10:6] → 绿
+ *     绿输入 → [ 5:1] 全亮  → 显示蓝 ⇒ [ 5:1] → 蓝
+ * 这三条合起来正是 **[15:11]→R、[10:5]→G、[4:0]→B，即标准 RGB565**。
+ *
+ * 用这个模型逐条复算彩条，三条全中：
+ *     红 0xF800 → 编码 0xF800 → R=100%     → 红 ✓
+ *     绿 0x07E0 → 编码 0x001F → G=2% B=48% → 暗蓝 ✓（观察：蓝）
+ *     蓝 0x001F → 编码 0x07C0 → G=98%      → 亮绿 ✓（观察：绿）
+ *
+ * ── 教训 ────────────────────────────────────────────────────────────────
+ *
+ * 「字段归属」（哪个字段归哪个通道）和「字段宽度」（字段各占几位）是两件事。
+ * 当初证明前者用的是**单比特探针**，那种数据天然推不出后者；宽度假设从未被
+ * 独立验证，就被写进了注释并当成定案。后来中间调（中性灰显示成紫色）出错，
+ * 正是错位一个比特的必然结果 —— **低位跑到了高位上**。
+ *
+ * 两套厂家参考（06 BSP 与 xiaozhi）**都没有任何字段重排步骤**。本文件此前的
+ * 偏离是唯一的异常。
+ *
+ * ── 但"删掉它就对了"这个结论只对了一半（同日稍后修正） ──────────────────
+ *
+ * 删掉重排后，纯色确实正确了（红/绿/蓝的三个字段各自归位），但**灰阶仍然
+ * 全错**：自标注色卡上，两块中性灰显示成品红。继续反推才发现还有第二个、
+ * 独立的问题：**16 位像素的字节序**（见下方 panel_send()）。
+ *
+ * 正确的收尾状态是：标准 RGB565 → **字节交换** → 面板（BGR 色序）。
+ * 也就是说 —— 数据在送面板前**确实需要一次变换**，只是那次变换是**字节
+ * 交换**，不是字段重排。当初的直觉（"面板要的东西和标准 RGB565 不一样"）
+ * 方向没错，但把变换认成了字段重排，而且那个重排公式恰好是个错位 1 比特的
+ * 东西，于是又叠了一层新错误。
+ *
+ * 【教训】"这个变换是多余的"和"这个变换是错的那种变换"是两回事。
+ * 删掉一个错误变换之后，如果症状只是**部分**好转，说明底下还有第二个问题，
+ * 不要就此收工 —— 而应该像这次一样，用能自证的测试（自标注色卡 + LVGL 侧
+ * 回读 + flush 侧回读）把每一段链路分别钉死。
+ * ========================================================================== */
 
 /* 前置声明：lcd_init() 需要用它做全屏填白（清 GRAM），
    而定义在文件后部。 */
@@ -329,22 +410,46 @@ esp_err_t lcd_init(void)
                                  &io_config, &io_handle),
         TAG, "New panel IO failed");
 
+    /* ---- 接线：色彩数据发送完成 → lcd_on_color_trans_done → 注册者 ----
+     * 必须在这里注册（而不是等 lcd_set_flush_done_cb 被调用），因为：
+     *   ① 调用方可能「先 lcd_init() 后注册钩子」——那种顺序下靠
+     *      lcd_set_flush_done_cb() 里的补注册也能接上；
+     *   ② 但 lcd_reinit() 会重建 panel IO，旧的注册随旧 io 销毁。
+     *      在每次 lcd_init() 里注册，钩子就天然跨 reinit 存活。
+     * 未注册任何钩子时，该回调只是多一次判空 —— 对既有绘制路径零影响。 */
+    const esp_lcd_panel_io_callbacks_t io_cbs = {
+        .on_color_trans_done = lcd_on_color_trans_done,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_register_event_callbacks(io_handle, &io_cbs, NULL),
+                        TAG, "register panel io callbacks failed");
+
     /* ---- ST7796 面板 ----
-     * rgb_ele_order：**实测裁决为 RGB（BGR 位 = 0）**，与两套厂家参考都相反。
+     * rgb_ele_order：**BGR**，与两套厂家参考（06 BSP、xiaozhi）一致。
      *
-     * 判据（2026-10-13 烧录实测）：配置 BGR 时彩条呈「蓝|绿|红|白|黑」——
-     * **红蓝互换、黑白正常**。黑白正常 ⇒ INVON 是对的、只有通道顺序错；
-     * 红蓝互换 ⇒ MADCTL 的 BGR 位(bit3)与这颗面板的物理接线相反。
+     * 【2026-10-13 定案：此前写 RGB 是错的，且这个错误与「缺字节交换」互相掩护】
      *
-     * ⚠️ 06 BSP 与 xiaozhi 都写 BGR，且 06 BSP 能出图 —— 但「能出图」不等于
-     * 「颜色正确」，两套参考很可能同样是红蓝互换而未被察觉（此前从未有人
-     * 逐条核对过彩条颜色）。此处以**实测**为准，与「照搬不优化」原则不冲突：
-     * 偏离的判据已由观察者直接给出。
+     * 曾经的理由是「配 BGR 时彩条红蓝互换 ⇒ 本面板 bit3 极性与 IDF 假设相反」。
+     * 该结论作废 —— 当时的观测是在**同时缺字节交换**的前提下做的，两个错误
+     * 叠在一起，读数自然指向了错误的方向。
      *
-     * 终值 MADCTL 随之由 0xE8 变为 **0xE0**（见下方初始化注释）。 */
+     * 完整的真相（对着一张自标注色卡逐格反推得出，8/8 全中，推演见文件顶部）：
+     *   ① 本面板**需要** bit3 = 1（即 `LCD_RGB_ELEMENT_ORDER_BGR`）；
+     *   ② ESP32-S3 的 SPI LCD 驱动发 16 位像素时**低字节先出**，面板收到的
+     *      是字节序颠倒的值，必须由软件预交换（见 `panel_send()`）。
+     *   两者缺一不可，且**必须同时正确**：
+     *     只有 ① ：红蓝互换
+     *     只有 ② ：绿字段被彻底打散（6 位且跨字节边界）
+     *     都没有 ：红和蓝碰巧看着对，绿全错 —— 本项目就卡在这个状态里
+     *
+     * 为什么这个状态极难识破：R 与 B 都是 5 位且在字中位置对称，两个错误对
+     * 它们几乎完全抵消，纯色一直"看起来没问题"；而**绿是 6 位、跨字节边界**，
+     * 字节交换会把它拆到乱七八糟的位置。绿又是亮度主通道，于是中间调、灰阶
+     * 全线崩塌 —— 这就是"纯色勉强过、灰阶全错"的真正机制。
+     *
+     * 终值 MADCTL 随之由 0xE0 变为 **0xE8**（见下方初始化注释）。 */
     const esp_lcd_panel_dev_config_t panel_config = {
         .reset_gpio_num = GPIO_NUM_NC,               /* 06 BSP: BSP_LCD_RST = NC */
-        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,
+        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_BGR,
         .bits_per_pixel = 16,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7796(io_handle, &panel_config, &s_panel),
@@ -366,10 +471,10 @@ esp_err_t lcd_init(void)
     }
 
     /* ---- 面板初始化序列（照搬 xiaozhi 顺序）----
-     * 注意 MADCTL 是**驱动累加**出来的终值 0xE0：
-     *   BGR 位由 rgb_ele_order 决定 —— 实测为 RGB ⇒ 不加 0x08；
-     *   swap_xy(true) 加 MV(0x20) → 0x20；
-     *   mirror(true,true) 再加 MX|MY(0x40|0x80) → 0xE0。
+     * 注意 MADCTL 是**驱动累加**出来的终值 0xE8：
+     *   BGR 位由 rgb_ele_order 决定 —— BGR ⇒ 加 0x08；
+     *   swap_xy(true) 加 MV(0x20) → 0x28；
+     *   mirror(true,true) 再加 MX|MY(0x40|0x80) → 0xE8。
      * 手写 0x00 或 0x08 会黑屏/花屏，必须靠这三个 API 逐步设置。 */
     ESP_LOGI(TAG, "面板初始化序列开始（SLPOUT → MADCTL → COLMOD → 14 条厂商表）");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init failed");
@@ -421,7 +526,12 @@ bool lcd_is_ready(void)
 esp_err_t lcd_reinit(void)
 {
     /* 重建顺序（实测要求，见 docs/architecture.md 7.x）：
-       必须先摘设备再释放总线，否则 DMA 不会重新绑定。 */
+       必须先摘设备再释放总线，否则 DMA 不会重新绑定。
+
+       ⚠️ P2 起（LVGL 接入后）本函数**只允许在 ui_lvgl_init() 之前调用**。
+       它会 esp_lcd_panel_del() 并重建句柄；若 LVGL 的渲染任务正在 flush，
+       就会拿已释放的句柄发 DMA。完成钩子本身跨 reinit 存活（lcd_init() 会
+       重新注册），但**并发调用**依然非法。 */
     ESP_LOGW(TAG, "重新初始化 LCD");
 
     if (s_panel != NULL) {
@@ -437,6 +547,79 @@ esp_err_t lcd_reinit(void)
     s_ready = false;
     return lcd_init();
 }
+
+/* ==========================================================================
+ * 送往面板的**唯一出口** —— 标准 RGB565 → 面板
+ *
+ * 全项目只有这里调用 esp_lcd_panel_draw_bitmap。所有绘制路径（LVGL flush、
+ * lcd_fill、彩条、棋盘格、进度条、各探针）都经过这里，颜色相关的变换只需
+ * 维护一处。这是**刻意收口**：此前各路径各写各的，直接导致「LVGL 画的」与
+ * 「自检画的」颜色不一致，排障时无法互相印证。
+ *
+ * ── 这里做的变换：字节交换。**它不是可选项。** ──────────────────────────
+ *
+ * ESP32-S3 的 SPI LCD 驱动发送 16 位像素时**低字节先出**，面板收到的是字节
+ * 序颠倒的值。不补这一步，**绿字段（6 位且横跨字节边界）会被彻底打散**，
+ * 而红/蓝字段（各 5 位、在字中位置对称）几乎不受影响 —— 外在表现正是
+ * 「纯色勉强看着对、灰阶与中间调全错」。本项目曾长期困在这个状态。
+ *
+ * xiaozhi 的 `flags.swap_bytes = 1` 补的是同一个东西
+ * （它在 LVGL 端口里逐像素调 `lv_draw_sw_rgb565_swap()`）。
+ * 本项目放在这里，好处是**所有**绘制路径都自动带上，
+ * 不会出现"某条路径忘了交换、于是两条路径互相矛盾"的情况。
+ *
+ * ⚠️ 本函数**就地改写** buf ⇒ 调用方在 DMA 完成前不得复用该缓冲；
+ *    逐行调用的调用方**必须每行重新填缓冲**（连续两次调用等于没交换）。
+ * ========================================================================== */
+static esp_err_t panel_send(int x_start, int y_start, int x_end, int y_end,
+                            uint16_t *buf, size_t n_px)
+{
+    for (size_t i = 0; i < n_px; i++) {
+        buf[i] = (uint16_t)((buf[i] >> 8) | (buf[i] << 8));
+    }
+    return esp_lcd_panel_draw_bitmap(s_panel, x_start, y_start, x_end, y_end, buf);
+}
+
+/* ==========================================================================
+ * LVGL 端口用的位图写入接口（P2 新增）
+ *
+ * 存在的意义：把「面板句柄」与「非标准色序」这两件事**继续封在组件内部**。
+ * LVGL 侧只交出标准 RGB565 位图，不需要、也拿不到 panel 句柄。
+ *
+ * 这样做的直接收益：将来若换面板/换驱动芯片/色序结论被修正，
+ * 影响范围都锁在本文件内，LVGL 那层一字不用改。
+ * ========================================================================== */
+esp_err_t lcd_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
+                          uint16_t *pixels)
+{
+    if (!s_ready || s_panel == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (pixels == NULL ||
+        x_start < 0 || y_start < 0 ||
+        x_end > GEC_LCD_H_RES || y_end > GEC_LCD_V_RES ||
+        x_end <= x_start || y_end <= y_start) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 标准 RGB565 交给 panel_send() —— 它负责唯一的传输前变换（字节交换）
+       与硬件写入。本函数不再自己碰颜色，理由见 panel_send() 的说明。
+
+       就地改写：panel_send 会**原地**交换 pixels 的字节，故调用方在 DMA
+       完成前不得复用该缓冲 —— 这正是完成钩子存在的理由。 */
+    const size_t n_px = (size_t)(x_end - x_start) * (size_t)(y_end - y_start);
+    return panel_send(x_start, y_start, x_end, y_end, pixels, n_px);
+}
+
+/* lcd_draw_bitmap_raw() 已于 2026-10-13 **删除**。
+ *
+ * 它当初存在的唯一理由，是给「面板收到某个 16 位值后显示成什么」和
+ * 「panel_encode 的换算对不对」造一个对照臂 —— 一个编码、一个不编码。
+ * 既然 panel_encode() 已被证实是错误的（它把字段整体错位了 1 比特，见文件
+ * 前部废除说明），两条路径现在**逐字节相同**，对照臂也就没有了存在意义。
+ *
+ * 再保留它反而有害：它的注释会写着「本函数画出来的颜色是错的」，
+ * 而事实已不再如此，后人照着注释理解会被带偏。 */
 
 /* ==========================================================================
  * 绘制 —— 原样照搬 06 BSP 的 lcd_set_color()
@@ -464,14 +647,14 @@ esp_err_t lcd_fill(uint16_t color)
         return ESP_ERR_NO_MEM;
     }
 
-    const uint16_t enc = panel_encode(color);
-    for (size_t i = 0; i < GEC_LCD_H_RES; i++) {
-        buffer[i] = enc;
-    }
-
     esp_err_t ret = ESP_OK;
     for (int y = 0; y < GEC_LCD_V_RES; y++) {
-        ret = esp_lcd_panel_draw_bitmap(s_panel, 0, y, GEC_LCD_H_RES, y + 1, buffer);
+        /* ⚠️ 缓冲必须在**每行发送前**重填：panel_send() 会就地交换字节，
+           若只在循环外填一次，第二行会被"交换回去"，颜色又错了。 */
+        for (size_t i = 0; i < GEC_LCD_H_RES; i++) {
+            buffer[i] = color;
+        }
+        ret = panel_send(0, y, GEC_LCD_H_RES, y + 1, buffer, GEC_LCD_H_RES);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "第 %d 行绘制失败: %s", y, esp_err_to_name(ret));
             break;
@@ -502,9 +685,9 @@ static esp_err_t draw_pattern(uint16_t (*pixel_at)(int x, int y))
     esp_err_t ret = ESP_OK;
     for (int y = 0; y < GEC_LCD_V_RES; y++) {
         for (int x = 0; x < GEC_LCD_H_RES; x++) {
-            buffer[x] = panel_encode(s_pixel_at(x, y));
+            buffer[x] = s_pixel_at(x, y);   /* 每行重填：panel_send 会就地交换字节 */
         }
-        ret = esp_lcd_panel_draw_bitmap(s_panel, 0, y, GEC_LCD_H_RES, y + 1, buffer);
+        ret = panel_send(0, y, GEC_LCD_H_RES, y + 1, buffer, GEC_LCD_H_RES);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "第 %d 行绘制失败: %s", y, esp_err_to_name(ret));
             break;
@@ -538,32 +721,21 @@ esp_err_t lcd_draw_color_bars(void)
 }
 
 /* ==========================================================================
- * 位权重探针 —— 判定「6 位字段属于绿还是蓝」
+ * 颜色验证探针
  *
- * 【已确定的事实（2026-10-13 一轮 2×5 矩阵实测，10 点全部吻合）】
+ * 【为什么要加灰阶，而不再只测八色】
+ * 纯色（红/绿/蓝）只能验证「通道有没有接反」，它**对字段错位天然不敏感** ——
+ * 本项目的教训就在这里：面板其实一直是标准 RGB565，八色在错误的编码下也曾
+ * 一度「看起来通过」，直到中间调（中性灰显示成紫色）才暴露。
  *
- *   MADCTL bit3 = 0 时，控制器把 16 位像素按**字段**这样路由：
- *       F0 [15:11] (5 位) → 红
- *       F1 [10:5]  (6 位) → 蓝
- *       F2 [4:0]   (5 位) → 绿
- *   bit3 = 1 时交换 F0 / F1 的去向（屏幕上表现为红蓝互换）—— 即 bit3 行为
- *   与 IDF 定义一致，但它**管不到 F1 该给绿还是给蓝**。
+ * 原因很直白：纯色是每个通道取极值。错位一个比特后，极值挪到相邻字段，
+ * 看上去仍然是一个饱和的近似色，肉眼很容易放过；而中间调里每一位都在
+ * 参与配比，错位立刻变成明显的偏色。
  *
- * 结论：这颗面板认的字段顺序是 **R, B, G**，而非 RGB565 标准的 R, G, B。
- * 任何 MADCTL 取值都修不好，只能在送数据前重排字段。
- *
- * 【仍未定的一处：位宽分配】
- *   F1 是 6 位、F2 是 5 位，而蓝只有 5 位、绿有 6 位 —— 谁拿 6 位？
- *     模型 A：F1→蓝(6位)、F2→绿(5位)   ⇒ 绿丢 1 位精度
- *     模型 B：[10:6]→蓝(5位)、[5:0]→绿(6位) ⇒ **无损**
- *   这决定重排时该左移 5 位还是 6 位，选错会让中间调掺错通道。
- *
- * 【为什么用 0x0020 判定】
- *   只置 bit5 时：
- *     模型 A：bit5 落在 F1 内 → **蓝**
- *     模型 B：bit5 是绿色字段的 MSB → **绿**
- *   **颜色本身不同**，不依赖对亮度的主观判断 —— 亮度类判据在本项目里
- *   已经出过事，能避就避。
+ * 故本探针的**主判据是那两级中性灰**：
+ *   0x8410 与 0xCE79 是标准的中性灰（R、G、B 三通道各自约 50% / 80%）。
+ *   只要屏幕上它们呈现**任何色调**（偏绿/偏蓝/偏红/发紫），即为错误。
+ * 这一条比八色更硬 —— 中性灰在正确的实现里没有任何理由偏色。
  * ========================================================================== */
 esp_err_t lcd_color_probe(void)
 {
@@ -571,22 +743,23 @@ esp_err_t lcd_color_probe(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 八标准色 + 彩条 —— 验证 panel_encode() 是否让三个通道同时归位。
-       八色覆盖了单通道与两两组合的全部情形，任一通道错位都会立刻显形；
-       单色全屏，没有彩条那种「左右读数顺序」的隐患。 */
+    /* 八标准色 + 两级中性灰 + 彩条。
+       八色覆盖单通道与两两组合的全部情形；灰阶作为中间调的主判据。 */
     static const struct { uint16_t color; const char *name; } k_seq[] = {
         { 0xF800, "红"   }, { 0x07E0, "绿"   }, { 0x001F, "蓝"   },
         { 0xFFE0, "黄"   }, { 0x07FF, "青"   }, { 0xF81F, "品红" },
         { 0xFFFF, "白"   }, { 0x0000, "黑"   },
+        { 0x8410, "中性灰（约50%）" }, { 0xCE79, "浅灰（约80%）" },
     };
     const int step_cnt = (int)(sizeof(k_seq) / sizeof(k_seq[0]));
 
-    ESP_LOGW(TAG, "========== 颜色编码验证 ==========");
-    ESP_LOGW(TAG, "已启用 panel_encode()：标准 RGB565 → 面板实际需要的 R,B,G 字段顺序");
-    ESP_LOGW(TAG, "**判据：屏幕颜色与下方文字全部相符，即编码正确**");
+    ESP_LOGW(TAG, "========== 颜色验证 ==========");
+    ESP_LOGW(TAG, "标准 RGB565 **直通**（无任何字段重排）—— 与两套厂家参考一致");
+    ESP_LOGW(TAG, "判据：屏幕颜色与下方文字全部相符");
+    ESP_LOGW(TAG, "**重点看最后两级灰：必须是不带任何色调的中性灰**");
 
     for (int i = 0; i < step_cnt; i++) {
-        ESP_LOGW(TAG, "  第 %d/%d 步：屏幕应为【%s】 (标准值 0x%04X)",
+        ESP_LOGW(TAG, "  第 %d/%d 步：屏幕应为【%s】 (值 0x%04X)",
                  i + 1, step_cnt, k_seq[i].name, k_seq[i].color);
         const esp_err_t ret = lcd_fill(k_seq[i].color);
         if (ret != ESP_OK) {
@@ -634,14 +807,13 @@ esp_err_t lcd_draw_progress_bar(int y, int height, uint16_t color)
     if (buffer == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    const uint16_t enc = panel_encode(color);
-    for (size_t i = 0; i < GEC_LCD_H_RES; i++) {
-        buffer[i] = enc;
-    }
-
     esp_err_t ret = ESP_OK;
     for (int yy = y; yy < y + height; yy++) {
-        ret = esp_lcd_panel_draw_bitmap(s_panel, 0, yy, GEC_LCD_H_RES, yy + 1, buffer);
+        /* ⚠️ 每行重填：panel_send() 会就地交换字节，只填一次会互相抵消 */
+        for (size_t i = 0; i < GEC_LCD_H_RES; i++) {
+            buffer[i] = color;
+        }
+        ret = panel_send(0, yy, GEC_LCD_H_RES, yy + 1, buffer, GEC_LCD_H_RES);
         if (ret != ESP_OK) {
             break;
         }

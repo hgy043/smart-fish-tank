@@ -29,6 +29,7 @@
 #include "gec_board.h"
 #include "lcd_display.h"
 #include "audio_service.h"
+#include "ui_lvgl.h"
 #include "app_config.h"
 #include "app_events.h"
 #include "app_types.h"
@@ -340,28 +341,31 @@ static void p05_run(void)
     return;
 #endif
 
-#if P05_TEST_LCD
+#if P05_LCD_INIT
     /* ======================================================================
-     * LCD 项 —— 已改为**移植**粤嵌官方已验证 BSP（06-tcp_client_bafa_mqtt），
-     * 不再自行重写、不再做参数扫描。
+     * LCD 上电初始化
      *
-     * 此前十几轮失败的根本原因是"重写"而非"复用"：自己选 SPI 模式、
-     * 自己定 max_transfer_sz/条带尺寸、自己删掉片选步骤、自己造扫描框架，
+     * ⚠️ P2 起这是**必需步骤**，不只是自检 —— lcd_init() 就在这里，
+     *    而 ui_lvgl_init() 要求 lcd_is_ready() 为真。
+     *    下面的绘制自检可以关（P05_TEST_LCD_DRAW），初始化不行。
+     *
+     * 历史：LCD 的初始化序列是逐行移植粤嵌官方已验证 BSP
+     * （06-tcp_client_bafa_mqtt）而来的。此前十几轮失败的根本原因是"重写"
+     * 而非"复用"——自己选 SPI 模式、自己定缓冲尺寸、自己删掉片选步骤，
      * 每一步都引入新变量，失败时无法区分是哪个变量的错。
-     *
-     * 现在只做一件事：按厂家顺序初始化，然后画彩条，看屏幕。
      * ====================================================================== */
-    ESP_LOGI(TAG, "[P05] ========== LCD 点屏（移植版）==========");
+    ESP_LOGI(TAG, "[P05] ========== LCD 初始化 ==========");
 
     esp_err_t ret = lcd_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "[P05] lcd_init 失败: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "[P05] lcd_init 失败: %s —— 界面将不可用", esp_err_to_name(ret));
     } else {
         lcd_dump_pin_levels();
 
         (void)lcd_backlight(true);
         vTaskDelay(pdMS_TO_TICKS(300));
 
+#if P05_TEST_LCD_DRAW
         /* 先按参考实现的参数画一次，若正常则应看到彩条 */
         ret = lcd_draw_color_bars();
         ESP_LOGI(TAG, "[P05] 彩条绘制（参考参数 方向=MV+MX+MY）-> %s",
@@ -398,9 +402,13 @@ static void p05_run(void)
         ESP_LOGI(TAG, "[P05] 方向/背光枚举试验已关闭（另有开关）；"
                       "彩条保持显示，便于核对颜色顺序");
 #endif
+#endif  /* P05_TEST_LCD_DRAW */
+
+        /* 绘制自检全部关闭时，屏幕停在"已初始化但未画内容"的黑屏状态，
+           随后交给 ui_task 里的 ui_lvgl_init() 接管。 */
     }
-    ESP_LOGI(TAG, "[P05] ========== LCD 点屏结束 ==========");
-#endif
+    ESP_LOGI(TAG, "[P05] ========== LCD 初始化结束 ==========");
+#endif  /* P05_LCD_INIT */
 
 #if P05_TEST_C1_I2S_COLLISION
     p05_c1_collision_test();
@@ -572,8 +580,32 @@ static void ui_task(void *arg)
     ESP_LOGI(TAG, "ui_task 启动 (优先级 %d, 核心 %d, 栈 %d)",
              APP_TASK_PRIO_UI, APP_TASK_CORE_1, APP_TASK_STACK_UI);
 
+    /* ======================================================================
+     * P2：LVGL 初始化
+     *
+     * 在本任务内做 —— 本工程约定「LVGL 的初始化与显示对象创建只发生在 ui_task」。
+     * 前置条件：lcd_init() 已由 p05_run() 完成（ui_lvgl_init() 内部会检查
+     * lcd_is_ready()，不满足直接返回错误）。
+     *
+     * 注意它会阻塞十余秒（开屏色卡自检，见 ui_lvgl_config.h），这是刻意的：
+     * 那一屏自查一次性覆盖「LVGL 渲染 → 标准 RGB565 直通 → SPI → DMA 完成」
+     * 整条新路径，且把判据压进**同一张照片**，不依赖人工记忆顺序。
+     * ====================================================================== */
+    const esp_err_t iret = ui_lvgl_init();
+    if (iret != ESP_OK) {
+        /* 刻意**不**删除本任务：monitor_task 持有它的句柄，对已删除任务的
+           句柄调 uxTaskGetStackHighWaterMark 是未定义行为。
+           保留任务空转，代价可忽略。 */
+        ESP_LOGE(TAG, "ui_lvgl_init 失败: %s —— 界面停用，其余功能不受影响",
+                 esp_err_to_name(iret));
+        for (;;) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        }
+    }
+
     const TickType_t period = pdMS_TO_TICKS(APP_UI_REFRESH_PERIOD_MS);
     TickType_t last_wake = xTaskGetTickCount();
+    TickType_t last_data = 0;
     uint32_t   loop = 0;
 
     for (;;) {
@@ -584,11 +616,24 @@ static void ui_task(void *arg)
          */
         vTaskDelayUntil(&last_wake, period);
 
-        /* --- 此处为 LVGL 刷新区（P2 接入） --- */
+        /* 界面数据不需要 30ms 这么密：读快照本身很便宜，但每次写入标签
+           都会让 LVGL 标脏并重绘。按 APP_UI_DATA_PERIOD_MS 节流。 */
+        const TickType_t now = xTaskGetTickCount();
+        if ((now - last_data) < pdMS_TO_TICKS(APP_UI_DATA_PERIOD_MS)) {
+            continue;
+        }
+        last_data = now;
+
+        tank_ecosystem_t snap;
+        eco_snapshot(&snap);          /* 互斥拷贝一份快照，不与写者竞争 */
+
+        /* 内部完成：上锁 → 更新控件 → 解锁 → 唤醒渲染任务。
+           取锁超时返回 false，属正常节流，不报错。 */
+        (void)ui_lvgl_update(&snap);
 
         /* 每 10 秒打一次心跳。用 ESP_LOGD 以便需要时用日志等级过滤，
            避免长期运行时刷屏。 */
-        if (++loop % (10000 / APP_UI_REFRESH_PERIOD_MS) == 0) {
+        if (++loop % (10000 / APP_UI_DATA_PERIOD_MS) == 0) {
             ESP_LOGD(TAG, "ui_task 心跳 %"PRIu32, loop);
         }
     }

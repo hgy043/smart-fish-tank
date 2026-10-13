@@ -103,3 +103,53 @@ CONFIG_MQTT_TRANSPORT_SSL=n
 CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
 # lwIP socket 数：MQTT + 后续 HTTP(AI/OTA) + DNS 并发，默认 10 偏紧
 CONFIG_LWIP_MAX_SOCKETS=16
+
+# ---------------------------------------------------------------------------
+# LVGL（P2 接入）
+#
+# ⚠️ 顺序陷阱（与上面 MQTT 那条同类）：
+#   CONFIG_LV_* 符号在 lvgl 组件被 component manager **拉下来之前不存在**。
+#   若在没有该组件时先写这些配置，kconfig 会**静默丢弃**，不报任何错。
+#   正确顺序：① 改 main/idf_component.yml → ② idf.py reconfigure 拉组件
+#             → ③ 再写本段 → ④ reconfigure → ⑤ grep sdkconfig 复核生效
+#
+# 本段的取值**对齐参考工程 xiaozhi-esp32-1.9.4-gec**（两工程同 IDF 5.5.3）。
+# ---------------------------------------------------------------------------
+
+# 用 Kconfig 而非手写 lv_conf.h（LVGL 9 的官方推荐方式）
+CONFIG_LV_CONF_SKIP=y
+
+# --- 内存分配：用标准 C 库，**不要**用 LVGL 自带内存池 ---
+# LVGL 自带的 BUILTIN_MALLOC 会在内部 RAM 里锁死一个固定池
+# （LV_MEM_SIZE_KILOBYTES 默认 64KB），无法增长、也无法落到 PSRAM。
+# 改用 CLIB 后 LVGL 走 IDF 堆，后续接图片资源（PNG 解码帧等）才能利用 PSRAM。
+CONFIG_LV_USE_CLIB_MALLOC=y
+# 字符串与格式化也走 C 库，省 flash
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+
+# --- 字体：完整字库需要这一项 ---
+# 78/xiaozhi-fonts 组件的 CMakeLists 用 file(GLOB src/*.c) 编译**全部**字体，
+# 其中的 30px 字号字形偏移超出 LVGL 默认的 20 位上限，会直接：
+#     #error "Too large font or glyphs in FONT_PUHUI_30_4.
+#             Enable LV_FONT_FMT_TXT_LARGE in lv_conf.h"
+# 并伴随大量 -Werror=overflow。参考工程 xiaozhi 同样是开着的。
+CONFIG_LV_FONT_FMT_TXT_LARGE=y
+
+# 78/xiaozhi-fonts 的 emoji 字体（font_emoji_32/64.c）调用 lv_imgfont_create()，
+# 该函数由本特性提供。不开启会编不过（implicit declaration）。
+# P2 的界面用不到 emoji，但该组件的 CMakeLists 用 GLOB 编译**全部**字体文件，
+# 无法只挑需要的编。参考工程 xiaozhi 同样是开着的。
+CONFIG_LV_USE_IMGFONT=y
+
+# --- 日志：首轮点亮与调色期间开启，便于看到 LVGL 自身的告警与断言 ---
+# 界面稳定后可关掉省一点 flash。
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_LEVEL_WARN=y
+CONFIG_LV_LOG_PRINTF=y
+
+# 注：以下各项**用 Kconfig 默认即可，不需在此重复写**（已逐项核对默认值）
+#   CONFIG_LV_COLOR_DEPTH=16、CONFIG_LV_DEF_REFR_PERIOD=33、
+#   CONFIG_LV_OS_NONE、CONFIG_LV_USE_THEME_DEFAULT、CONFIG_LV_USE_FLEX/GRID、
+#   CONFIG_LV_USE_ASSERT_NULL/MALLOC
+# 也**不要**抄 xiaozhi 的 PNG/GIF/BMP/IMGFONT/OBSERVER/DEMOS —— P2 用不上。

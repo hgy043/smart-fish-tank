@@ -8,3 +8,21 @@ dependencies:
     version: '>=5.3'
   espressif/esp_codec_dev:
     version: '~1.4.0'
+
+  # ==========================================================================
+  # LVGL（P2 接入）—— 版本**严格对齐** xiaozhi-esp32-1.9.4-gec，两工程同 IDF 5.5.3
+  #   lvgl/lvgl            → 实际 9.3.0
+  #   espressif/esp_lvgl_port → 实际 2.6.3
+  # 说明：本项目**不使用** esp_lvgl_port 的 lvgl_port_add_disp()，只用它的
+  #       任务/递归锁/tick 三样基础设施，理由见 components/ui_lvgl/ui_lvgl.c 顶部注释。
+  # ==========================================================================
+  lvgl/lvgl:
+    version: '~9.3.0'
+  espressif/esp_lvgl_port:
+    version: '~2.6.0'
+
+  # 中文字体（普惠体 20px 等）。P2 初期先用完整字库把屏点起来，
+  # 等鱼缸界面文案定稿后再用 lv_font_conv 按需裁剪（体积可从 MB 级降到百 KB 级）。
+  # 注：它**不参与 LVGL 的链接**，由使用方按需 include 对应的字体数组头文件。
+  78/xiaozhi-fonts:
+    version: '~1.5.2'

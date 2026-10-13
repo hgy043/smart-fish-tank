@@ -59,18 +59,22 @@ esp_err_t lcd_fill(uint16_t color565);
 esp_err_t lcd_draw_color_bars(void);
 
 /**
- * @brief 颜色编码验证：全屏依次刷 红→绿→蓝→黄→青→品红→白→黑（各 2 秒），
- *        最后重画彩条；每一步的「应该是什么颜色」同步打印到串口。
+ * @brief 颜色验证：全屏依次刷 红→绿→蓝→黄→青→品红→白→黑→中性灰→浅灰
+ *        （各 2 秒），最后重画彩条；每一步的「应该是什么颜色」同步打印到串口。
  *
- * @note  用途：验证 `panel_encode()` 的字段重排是否正确。八色覆盖了单通道与
- *        两两组合的全部情形，任一通道错位都会立刻显形；每次全屏单色，没有
- *        彩条那种「左→右」的人为读数顺序隐患。
+ * @note  用途：验证整条颜色链。八色覆盖了单通道与两两组合的全部情形，
+ *        任一通道接反都会立刻显形；每次全屏单色，没有彩条那种「左→右」
+ *        的人为读数顺序隐患。
  *
- *        **背景（2026-10-13 实测定案）**：这颗面板的控制器不按 RGB565 标准
- *        排字段，实测为 **R, B, G**（[15:11]→红、[10:5]→蓝(6位)、[4:0]→绿(5位)）。
- *        判据：0x07E0 显示蓝、0x0020(bit5) 显示蓝 ⇒ 该 6 位字段归蓝不归绿。
- *        MADCTL 修不好它（bit3 只交换 F0/F1 去向），故改为送数据前重排字段，
- *        见 lcd_display.c 的 `panel_encode()`。
+ *        **最后两级中性灰才是主判据。** 纯色对「字段错位」天然不敏感 ——
+ *        每个通道取极值时，错位一个比特后仍是一个饱和的近似色，肉眼容易放过。
+ *        中间调里每一位都参与配比，错位立刻变成明显偏色。
+ *
+ *        **背景（2026-10-13 定案，推翻了同日的旧结论）**：这颗面板就是**标准
+ *        RGB565** 设备（[15:11]→R、[10:5]→G、[4:0]→B），与两套厂家参考一致。
+ *        此前一度判定为「R,B,G 字段顺序」并在送数据前重排，那个重排函数
+ *        `panel_encode()` 实际把三个字段**整体错位了 1 个比特**，已被证实是
+ *        中间调偏色的根因，现已删除。详见 lcd_display.c 的废除说明。
  */
 esp_err_t lcd_color_probe(void);
 
@@ -80,10 +84,66 @@ esp_err_t lcd_draw_checkerboard(int cell);
 /** @brief 在指定行区间画一根横条（用于观察画面能否稳定保持）。 */
 esp_err_t lcd_draw_progress_bar(int y, int height, uint16_t color);
 
+/* ==========================================================================
+ * LVGL 端口支持（P2 新增）
+ *
+ * 设计意图：把「面板句柄」与「非标准色序」继续封在组件内部。
+ * 上层只交出标准 RGB565 位图，不需要、也拿不到 panel 句柄 ——
+ * 将来换面板 / 换驱动 / 修正色序结论时，影响范围都锁在本组件内。
+ * ========================================================================== */
+
+/**
+ * @brief 把一块**标准 RGB565** 位图写入面板。
+ *
+ * @param x_start,y_start 区域左上角（含）
+ * @param x_end,y_end     区域右下角（**不含**，与 esp_lcd_panel_draw_bitmap 一致）
+ * @param pixels          宽×高 个标准 RGB565 像素，行连续、无行距。
+ *                        ⚠️ **会被就地改写** —— 内部要做字节交换
+ *                        （ESP32-S3 的 SPI LCD 驱动低字节先出，面板收到的
+ *                        是字节序颠倒的值；不补这一步绿字段会被打散，
+ *                        表现为"纯色勉强对、灰阶全错"）。
+ *                        在 DMA 传输完成前，调用方不得复用或读取该缓冲。
+ *
+ * @return ESP_OK；ESP_ERR_INVALID_STATE（LCD 未初始化）；
+ *         ESP_ERR_INVALID_ARG（pixels 为 NULL / 越界 / 空区域）；
+ *         其余为 esp_lcd_panel_draw_bitmap 透传的错误码。
+ *
+ * @warning **只能在任务上下文调用**（内部会阻塞等待 SPI 事务槽位），
+ *          **绝不可在中断里调用**。DMA 完成中断中只允许调用「只写一个标志」
+ *          的函数（如 lv_display_flush_ready），本函数不满足该条件。
+ *
+ * @note 返回 ESP_OK **≠ 像素已上屏**。esp_lcd_panel_draw_bitmap 是「排队即返回」的，
+ *       真正的完成信号由 panel IO 的 on_color_trans_done（中断）异步给出，
+ *       经 lcd_set_flush_done_cb() 注册的钩子转达。
+ *
+ * @note 本函数**不修改** pixels（历史版本曾就地重排字段，现已废除）。
+ *       但「DMA 完成前调用方不得复用该缓冲」这条约束**依然成立** ——
+ *       它是完成钩子存在的理由，与是否改写无关。
+ *
+ * @note 本函数不做内部加锁（与 lcd_display 既有约定一致）。
+ *       LVGL 端口在它自己的递归锁内串行调用，天然满足「单一绘制者」；
+ *       若要与 lcd_fill / lcd_draw_color_bars 等自检函数混用，
+ *       **必须由调用方互斥**。
+ */
+esp_err_t lcd_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
+                          uint16_t *pixels);
+
+/** 绘制完成钩子。在 panel IO 的 DMA 完成回调（**中断上下文**）中被调用。 */
+typedef void (*lcd_flush_done_cb_t)(void *user);
+
+/**
+ * @brief 注册「一块色彩数据已发送完成」的钩子（LVGL 的完成信号接在这里）。
+ *
+ * @note  可先 lcd_init() 后注册（会立即接到现存 panel IO 上）；
+ *        lcd_reinit() 重建 panel IO 时会自动重注册，**调用方无需处理**。
+ * @warning 钩子在**中断上下文**运行：不得阻塞、不得打日志、不得分配内存。
+ *          典型实现只有一句 `lv_display_flush_ready(disp);`。
+ */
+void lcd_set_flush_done_cb(lcd_flush_done_cb_t cb, void *user);
+
 /**
  * @brief 背光开/关（IO42，经 LEDC PWM）。
- * @note  极性由 lcd_display.c 的 LCD_BL_INVERT 决定。
- *        当前 = 1（高电平点亮），与能出图的 06 BSP 一致；该值仍在实测裁决中。
+ * @note  极性由 lcd_display.c 的 LCD_BL_INVERT 决定，**实测裁决为 1（高电平点亮）**。
  */
 esp_err_t lcd_backlight(bool on);
 
