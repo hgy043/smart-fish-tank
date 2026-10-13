@@ -153,3 +153,28 @@ CONFIG_LV_LOG_PRINTF=y
 #   CONFIG_LV_OS_NONE、CONFIG_LV_USE_THEME_DEFAULT、CONFIG_LV_USE_FLEX/GRID、
 #   CONFIG_LV_USE_ASSERT_NULL/MALLOC
 # 也**不要**抄 xiaozhi 的 PNG/GIF/BMP/IMGFONT/OBSERVER/DEMOS —— P2 用不上。
+
+# ============================================================================
+# 摄像头（P6-a）—— espressif/esp32-camera
+# ============================================================================
+# 板上 sensor 型号 —— **实测结果，不是按型号名猜的**（2026-10-13 上板）：
+#     camera: Camera PID=0x9b ... Detected GC0308 camera
+#     camera: Detected camera at address=0x21
+# 是 GC0308（I2C 0x21），**不是** OV2640（那会是 0x30 / PID 0x26）。
+# 这一项确保把 GC0308 的寄存器表编译进来（Kconfig 默认本就开，显式写死防将来被关）。
+CONFIG_GC0308_SUPPORT=y
+# OV2640 一并留着：驱动的探测表是逐个试的，多编一颗不影响本板，
+# 却能让换 sensor 时不必改配置。（诊断日志里那些 "Mismatch PID" 就是探测过程。）
+CONFIG_OV2640_SUPPORT=y
+
+# SCCB 走**新** I2C master 驱动（IDF ≥5.4 的默认值，这里显式写死防止将来被改）。
+# 旧驱动(sccb.c)用的是 driver/i2c.h 的老 API，与本工程的 i2c_master 总线模型
+# 不是一回事 —— 选错了 SCCB 会自己去 i2c_driver_install，与已有总线打架。
+CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y
+
+# DMA 缓冲上限：32KB(Kconfig 默认) → 8KB
+# 这块必须在**内部 RAM**（要 DMA 可达），是摄像头最大的内部 RAM 开销。
+# 8KB 是 xiaozhi 在同一块板上的取值，属已验证值，不是猜的。
+# 若日后画面撕裂/丢帧，可往上调，但要盯住 monitor_task 的内部堆余量（≥30%）。
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=8192
+

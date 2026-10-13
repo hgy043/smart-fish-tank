@@ -7,8 +7,8 @@
  *
  *     主菜单 (UI_PAGE_MENU)
  *       ├─ 鱼缸情况 (UI_PAGE_TANK)   —— 六张数据卡片
- *       ├─ 小智AI互动 (UI_PAGE_AI)   —— 对话气泡（假数据）
- *       └─ SD卡相册 (UI_PAGE_ALBUM)  —— 九宫格缩略图（假数据）
+ *       ├─ 小智AI互动 (UI_PAGE_AI)   —— 拍照 + 照片显示（P6-a 接入真实摄像头）
+ *       └─ SD卡相册 (UI_PAGE_ALBUM)  —— 九宫格缩略图（假数据，待 TF 卡引脚确认）
  *
  * 【实现方式：预建 + 显隐切换】
  * 四个页面在初始化时一次建齐，切页只切 LV_OBJ_FLAG_HIDDEN。
@@ -18,6 +18,7 @@
  *
  * 【线程约定】
  * 本模块所有函数都在 **LVGL 锁内**调用 —— 由 ui_lvgl 负责加解锁。
+ * **唯一的例外是 `ui_pages_take_capture_request()`**，见其说明。
  * ============================================================================
  */
 #pragma once
@@ -65,6 +66,48 @@ void ui_pages_update_tank(const tank_ecosystem_t *snap);
  */
 lv_obj_t *ui_page_make_shell(lv_obj_t *parent, const char *title, bool with_back);
 
+/* ==========================================================================
+ * 「小智AI互动」页的拍照接口（P6-a）
+ * ========================================================================== */
+
+/**
+ * @brief 【**不加锁**】取走拍照请求。返回 true 表示用户按了拍照键。
+ *
+ * @note  本函数是**唯一**可以不用持 LVGL 锁的本模块函数，因为它是给
+ *        `ui_task` 在**锁外**轮询用的 —— 拍照动作用户按下后必须离开锁外执行
+ *        （`camera_service_capture()` 最长阻塞 4 秒，持锁会把 taskLVGL 卡死）。
+ *
+ *        「按了键」这个动作本身发生在 **taskLVGL 上下文且已持 LVGL 锁**，
+ *        回调里**只置一个 volatile 标志**，不做任何耗时操作。
+ *
+ * @note  读取即清零（取走语义），避免同一请求被处理两次。
+ */
+bool ui_pages_take_capture_request(void);
+
+/**
+ * @brief 照片控件（`lv_image`）。交给 ui_lvgl 设置图像源。
+ * @note  只应在 ui_lvgl 内部使用；直接调用者须已持 LVGL 锁。
+ */
+lv_obj_t *ui_pages_ai_photo(void);
+
+/**
+ * @brief 显示/隐藏照片区的占位提示。
+ * @note  调用者须已持 LVGL 锁。拍成第一张照片后应隐藏。
+ */
+void ui_pages_ai_hint_visible(bool visible);
+
+/**
+ * @brief 更新拍照区的状态文字与按钮可用性。
+ *
+ * @param text           显示在照片区中央的提示（NULL 或空串 = 不显示）。
+ *                       拍照前可写「拍摄中…」，失败时写原因。
+ * @param button_enabled false = 按钮置灰且点击无效（摄像头不可用时用）。
+ *
+ * @note 调用者须已持 LVGL 锁。
+ */
+void ui_pages_set_ai_status(const char *text, bool button_enabled);
+
 #ifdef __cplusplus
 }
 #endif
+

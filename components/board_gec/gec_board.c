@@ -69,9 +69,10 @@ esp_err_t gec_board_i2c_init(void)
     }
 
     const i2c_master_bus_config_t bus_cfg = {
-        /* -1 = 由驱动自动选择空闲 I2C 端口。
-           写死端口号会与同工程内的其它 I2C 使用者（SCCB、触摸屏）冲突。 */
-        .i2c_port          = -1,
+        /* 端口号**显式指定**（2026-10-13 由 -1 改来）。
+           理由见 gec_board.h 的 GEC_I2C_PORT_NUM —— 摄像头 SCCB 需要端口号
+           才能引用这条总线，自动分配给不出号码。 */
+        .i2c_port          = GEC_I2C_PORT_NUM,
         .sda_io_num        = GEC_I2C_SDA_GPIO,
         .scl_io_num        = GEC_I2C_SCL_GPIO,
         .clk_source        = I2C_CLK_SRC_DEFAULT,

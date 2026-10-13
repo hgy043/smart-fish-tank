@@ -23,6 +23,7 @@
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "lwip/inet.h"
 #include "nvs_flash.h"
 
@@ -30,6 +31,7 @@
 #include "lcd_display.h"
 #include "audio_service.h"
 #include "ui_lvgl.h"
+#include "camera_service.h"
 #include "app_config.h"
 #include "app_events.h"
 #include "app_types.h"
@@ -42,8 +44,9 @@ static const char *TAG = "app_main";
 /* ==========================================================================
  * 全局生态状态（唯一实例）
  *
- * 由 ui_task 与 mqtt_task 共享读取。写操作只发生在 sensor_task（P1 接入）；
- * 在此之前的链路状态由本文件的刷新函数维护。
+ * 由 ui_task 与 mqtt_task 共享读取。写操作只发生在：
+ *   · sensor_task        —— 传感器数值 + alert_mask（见 eco_sensor_sample）
+ *   · eco_refresh_links  —— 链路状态（wifi/mqtt/timestamp），**不碰告警**
  * 用互斥锁保护，避免读到「写了一半」的结构体。
  * ========================================================================== */
 static tank_ecosystem_t s_eco;
@@ -56,11 +59,16 @@ static esp_err_t eco_init(void)
         return ESP_ERR_NO_MEM;
     }
     memset(&s_eco, 0, sizeof(s_eco));
-    s_eco.ph             = 7.0f;
-    s_eco.water_temp_c   = 25.0f;
-    s_eco.air_temp_c     = 25.0f;
-    s_eco.air_humidity   = 50.0f;
-    s_eco.lux            = 300.0f;
+
+    /* 初值取各自游走量程的中点 —— 与 sensor_task 的随机游走衔接自然，
+       不会出现"开机瞬间从某个数猛跳到量程里"的观感。 */
+    s_eco.ph             = (SIM_PH_MIN    + SIM_PH_MAX)    * 0.5f;
+    s_eco.water_temp_c   = (SIM_WTEMP_MIN + SIM_WTEMP_MAX) * 0.5f;
+    s_eco.air_temp_c     = (SIM_ATEMP_MIN + SIM_ATEMP_MAX) * 0.5f;
+    s_eco.air_humidity   = (SIM_HUM_MIN   + SIM_HUM_MAX)   * 0.5f;
+    s_eco.lux            = (SIM_LUX_MIN   + SIM_LUX_MAX)   * 0.5f;
+    s_eco.turbidity_ntu  = (SIM_TURB_MIN  + SIM_TURB_MAX)  * 0.5f;
+    s_eco.tds_ppm        = (SIM_TDS_MIN   + SIM_TDS_MAX)   * 0.5f;
     return ESP_OK;
 }
 
@@ -84,8 +92,137 @@ static void eco_refresh_links(void)
     s_eco.timestamp      = (uint32_t)(esp_timer_get_time() / 1000000LL);
     s_eco.wifi_connected = wifi_sta_is_connected();
     s_eco.mqtt_connected = bafa_mqtt_is_connected();
-    s_eco.alert_active   = false;    /* P1 接入阈值判定后改写 */
+
+    /* ⚠️ 2026-10-13 删掉了这里原本的一句 `s_eco.alert_active = false;`。
+     *
+     * 它是个真 bug：本函数被 mqtt_task **每 10 秒**调一次（还有网络事件回调），
+     * 于是任何由采样算出的告警**活不过 10 秒**就被清掉 ——
+     * 现象会非常迷惑："告警偶尔闪一下就没了，像是随机的"。
+     *
+     * 现在 alert_mask / alert_active **只有一个写者**：eco_sensor_sample()
+     * 里的阈值判定。本函数只管链路状态，不碰告警。 */
     xSemaphoreGive(s_eco_mutex);
+}
+
+/* ==========================================================================
+ * 传感器数据模拟（P1 接入 ADS1115 之前的替代）
+ *
+ * ADS1115 不打算购买了（用户决定），故 pH / TDS / 浊度等一律由随机游走生成。
+ * 参数见 app_config.h 的 SIM_* 段 —— 那里解释了为什么是"游走"而不是"重掷"、
+ * 为什么量程要略超出阈值、以及为什么步长用量程的比例。
+ *
+ * ⚠️ 接真传感器时：把本段整体删掉，改成在 eco_sensor_sample() 里读实际值即可。
+ *    阈值判定与 alert_mask 的填充逻辑可以原样保留。
+ * ========================================================================== */
+
+/** 上一次的告警状态 —— 滞回判定要用。只有 sensor_task 读写，且在锁内。 */
+static bool s_alert_ph = false, s_alert_wtemp = false, s_alert_atemp = false;
+static bool s_alert_hum = false, s_alert_lux = false, s_alert_turb = false;
+static bool s_alert_tds = false;
+
+/** [-1, 1] 上的均匀随机数。
+ *  用 esp_random()（硬件 RNG）而不是 rand()：后者需要种子，且多个任务同时调
+ *  会竞争同一份全局状态。esp_random 无需播种、线程安全。 */
+static float sim_rand_sym(void)
+{
+    return ((float)(esp_random() % 2001u) - 1000.0f) / 1000.0f;
+}
+
+/** 随机游走一步：上次值 + 一个小随机步，夹在 [lo, hi] 内 */
+static float sim_walk(float prev, float lo, float hi)
+{
+    const float step = (hi - lo) * SIM_WALK_STEP_FRAC;
+    float v = prev + sim_rand_sym() * step;
+    if (v < lo) { v = lo; }
+    if (v > hi) { v = hi; }
+    return v;
+}
+
+/** 带滞回的越界判断。
+ *  进入：超出 [min, max]。
+ *  退出：回到 [min + hyst, max - hyst] 之内（比进入条件更严）。
+ *  was = 上一次是否处于告警。 */
+static bool sim_alert(float v, float min, float max, float hyst, bool was)
+{
+    if (was) {
+        return !(v >= (min + hyst) && v <= (max - hyst));
+    }
+    return (v < min || v > max);
+}
+
+/** 滞回幅度：取该量量程的一个比例（见 app_config.h 的说明） */
+#define SIM_HYST(lo, hi)  (((hi) - (lo)) * SIM_ALERT_HYST_FRAC)
+
+/** 模拟一次采样：游走全部量 → 按阈值算 alert_mask → 写回 s_eco */
+static void eco_sensor_sample(void)
+{
+    if (s_eco_mutex == NULL) {
+        return;
+    }
+
+    /* 「读旧值 → 游走 → 写回」整段持锁：与 eco_snapshot() 的读者互斥，
+       不会让界面读到"改了一半"的结构体。 */
+    xSemaphoreTake(s_eco_mutex, portMAX_DELAY);
+
+    s_eco.ph           = sim_walk(s_eco.ph,           SIM_PH_MIN,    SIM_PH_MAX);
+    s_eco.water_temp_c = sim_walk(s_eco.water_temp_c, SIM_WTEMP_MIN, SIM_WTEMP_MAX);
+    s_eco.air_temp_c   = sim_walk(s_eco.air_temp_c,   SIM_ATEMP_MIN, SIM_ATEMP_MAX);
+    s_eco.air_humidity = sim_walk(s_eco.air_humidity, SIM_HUM_MIN,   SIM_HUM_MAX);
+    s_eco.lux          = sim_walk(s_eco.lux,          SIM_LUX_MIN,   SIM_LUX_MAX);
+    s_eco.turbidity_ntu = sim_walk(s_eco.turbidity_ntu, SIM_TURB_MIN, SIM_TURB_MAX);
+    s_eco.tds_ppm      = sim_walk(s_eco.tds_ppm,      SIM_TDS_MIN,   SIM_TDS_MAX);
+
+    s_eco.timestamp = (uint32_t)(esp_timer_get_time() / 1000000LL);
+
+    /* 阈值判定。每项一步一算，顺带更新滞回状态。
+       位定义在 app_core/app_types.h 的 ECO_ALERT_*（那里也解释了为什么用位掩码）。 */
+    uint32_t mask = 0;
+
+    s_alert_ph = sim_alert(s_eco.ph, THRESHOLD_PH_MIN, THRESHOLD_PH_MAX,
+                           SIM_HYST(SIM_PH_MIN, SIM_PH_MAX), s_alert_ph);
+    if (s_alert_ph) { mask |= ECO_ALERT_PH; }
+
+    s_alert_wtemp = sim_alert(s_eco.water_temp_c,
+                              THRESHOLD_WATER_TEMP_MIN, THRESHOLD_WATER_TEMP_MAX,
+                              SIM_HYST(SIM_WTEMP_MIN, SIM_WTEMP_MAX), s_alert_wtemp);
+    if (s_alert_wtemp) { mask |= ECO_ALERT_WATER_TMP; }
+
+    s_alert_atemp = sim_alert(s_eco.air_temp_c,
+                              THRESHOLD_AIR_TEMP_MIN, THRESHOLD_AIR_TEMP_MAX,
+                              SIM_HYST(SIM_ATEMP_MIN, SIM_ATEMP_MAX), s_alert_atemp);
+    if (s_alert_atemp) { mask |= ECO_ALERT_AIR_TMP; }
+
+    s_alert_hum = sim_alert(s_eco.air_humidity,
+                            THRESHOLD_HUMIDITY_MIN, THRESHOLD_HUMIDITY_MAX,
+                            SIM_HYST(SIM_HUM_MIN, SIM_HUM_MAX), s_alert_hum);
+    if (s_alert_hum) { mask |= ECO_ALERT_HUMIDITY; }
+
+    s_alert_lux = sim_alert(s_eco.lux, THRESHOLD_LUX_MIN, THRESHOLD_LUX_MAX,
+                            SIM_HYST(SIM_LUX_MIN, SIM_LUX_MAX), s_alert_lux);
+    if (s_alert_lux) { mask |= ECO_ALERT_LUX; }
+
+    /* 浊度只有上限 —— 用 0 当虚拟下限，滞回逻辑照常工作 */
+    s_alert_turb = sim_alert(s_eco.turbidity_ntu, 0.0f, THRESHOLD_TURBIDITY_MAX,
+                             SIM_HYST(SIM_TURB_MIN, SIM_TURB_MAX), s_alert_turb);
+    if (s_alert_turb) { mask |= ECO_ALERT_TURBIDITY; }
+
+    s_alert_tds = sim_alert(s_eco.tds_ppm, THRESHOLD_TDS_MIN, THRESHOLD_TDS_MAX,
+                            SIM_HYST(SIM_TDS_MIN, SIM_TDS_MAX), s_alert_tds);
+    if (s_alert_tds) { mask |= ECO_ALERT_TDS; }
+
+    s_eco.alert_mask   = mask;
+    s_eco.alert_active = (mask != 0);
+
+    xSemaphoreGive(s_eco_mutex);
+
+    /* 只在告警集合变化时打一条日志 —— 每秒一条会把串口刷爆，
+       而"告警从无到有/从有到无"正是最需要留下痕迹的时刻。 */
+    static uint32_t s_last_mask = 0;
+    if (mask != s_last_mask) {
+        ESP_LOGW(TAG, "告警状态变化: 0x%02"PRIx32" -> 0x%02"PRIx32"（%s）",
+                 s_last_mask, mask, mask ? "有越界" : "全部正常");
+        s_last_mask = mask;
+    }
 }
 
 /* ==========================================================================
@@ -569,6 +706,83 @@ static void on_mqtt_event(void *arg, const app_event_msg_t *msg)
 }
 
 /* ==========================================================================
+ * 任务：sensor_task
+ *
+ * P1 的职责原本是「读 ADS1115 + 温湿度 + 光照」。ADS1115 不购买了，
+ * 故当前只做一件事：**按 APP_SAMPLE_PERIOD_MS 走一次随机游走并判定阈值**。
+ * 任务骨架、周期、栈都是照 P1 的规划来的，接真传感器时只需换掉取值部分。
+ *
+ * 为什么单独立一个任务而不是塞进 ui_task：
+ *   · 采样节拍（1s）与界面节拍（30ms/200ms）是两件事，耦合在一起以后
+ *     任一方调整都会牵动另一方；
+ *   · 将来接真实 ADC 时会有 I2C 阻塞，不该拖累界面刷新。
+ * ========================================================================== */
+static void sensor_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "sensor_task 启动 (优先级 %d, 核心 %d, 栈 %d)",
+             APP_TASK_PRIO_SENSOR, APP_TASK_CORE_1, APP_TASK_STACK_SENSOR);
+    ESP_LOGW(TAG, "传感器数据为**模拟值**（随机游走）—— ADS1115 未接入，"
+                  "参数见 app_config.h 的 SIM_* 段");
+
+    const TickType_t period = pdMS_TO_TICKS(APP_SAMPLE_PERIOD_MS);
+    TickType_t last_wake = xTaskGetTickCount();
+
+    for (;;) {
+        vTaskDelayUntil(&last_wake, period);
+        eco_sensor_sample();
+    }
+}
+
+/* ==========================================================================
+ * 拍照（P6-a）
+ *
+ * 【为什么是这个次序 —— 这是本轮唯一一处并发要害】
+ *
+ *   ① ui_lvgl_set_ai_status("拍摄中…")  —— 内部上锁，很快就返回
+ *   ② camera_service_capture()          —— **必须在锁外**，最长阻塞 4 秒
+ *   ③ ui_lvgl_show_photo()              —— 内部上锁，只切一次指针
+ *
+ * ② 若是持着 LVGL 锁做，taskLVGL 会被一起卡住 ——
+ * 界面停摆、触摸失灵，而且看起来像"死机"。所以按钮回调只置标志，
+ * 真正的抓帧留给这里（ui_task）在锁外执行。
+ *
+ * ① 用的是异步显示：taskLVGL 独立渲染，所以 ② 阻塞的这几秒里，
+ * 屏幕上能正常显示"拍摄中…"。
+ * ========================================================================== */
+static void ui_capture_photo(void)
+{
+    ui_lvgl_set_ai_status("拍摄中…", false);
+
+    const esp_err_t cret = camera_service_capture();
+    if (cret != ESP_OK) {
+        ESP_LOGE(TAG, "拍照失败: %s（%s）", esp_err_to_name(cret),
+                 camera_service_status());
+        ui_lvgl_set_ai_status(camera_service_status(), true);
+        return;
+    }
+
+    int w = 0, h = 0;
+    const uint16_t *px = camera_service_frame(&w, &h);
+    if (px == NULL) {
+        ESP_LOGE(TAG, "取不到画面帧");
+        ui_lvgl_set_ai_status("取不到画面", true);
+        return;
+    }
+
+    const esp_err_t sret = ui_lvgl_show_photo(px, w, h);
+    if (sret != ESP_OK) {
+        ESP_LOGE(TAG, "照片上屏失败: %s", esp_err_to_name(sret));
+        ui_lvgl_set_ai_status("显示失败", true);
+        return;
+    }
+
+    /* 成功：隐藏提示、恢复按钮文字 */
+    ui_lvgl_set_ai_status(NULL, true);
+    ESP_LOGI(TAG, "拍照完成 %dx%d", w, h);
+}
+
+/* ==========================================================================
  * 任务：ui_task
  *
  * P0 阶段先建立任务骨架与刷新节拍；LVGL 初始化在 P2 接入。
@@ -603,6 +817,18 @@ static void ui_task(void *arg)
         }
     }
 
+    /* 摄像头可用性一次性问清并写进界面。
+       摄像头在 app_main 第 6.6 步就初始化过了，此处只读状态。
+       不可用时把按钮置灰 + 显示原因 —— 用户点不动时能直接看到为什么，
+       不必去翻串口。 */
+    if (camera_service_is_ready()) {
+        ui_lvgl_set_ai_status("点下方按钮拍照", true);
+    } else {
+        ESP_LOGW(TAG, "摄像头不可用，AI 页拍照按钮已置灰：%s",
+                 camera_service_status());
+        ui_lvgl_set_ai_status(camera_service_status(), false);
+    }
+
     const TickType_t period = pdMS_TO_TICKS(APP_UI_REFRESH_PERIOD_MS);
     TickType_t last_wake = xTaskGetTickCount();
     TickType_t last_data = 0;
@@ -615,6 +841,13 @@ static void ui_task(void *arg)
          * vTaskDelayUntil 的绝对节拍推进，避免误差累积。
          */
         vTaskDelayUntil(&last_wake, period);
+
+        /* 拍照请求：按 **30ms 节拍**检查（不跟着下面的 200ms 数据节流走）——
+           用户按下到开始拍摄的延迟应当短。整个动作在**锁外**执行，
+           理由见 ui_capture_photo() 的说明。 */
+        if (ui_lvgl_capture_requested()) {
+            ui_capture_photo();
+        }
 
         /* 界面数据不需要 30ms 这么密：读快照本身很便宜，但每次写入标签
            都会让 LVGL 标脏并重绘。按 APP_UI_DATA_PERIOD_MS 节流。 */
@@ -774,6 +1007,17 @@ void app_main(void)
     /* 6.5 P0.5 硬件验证试验（会阻塞数秒，完成后才继续联网） */
     p05_run();
 
+    /* 6.6 摄像头（P6-a）
+       放在 lcd_init() 之后：它要经 PCA9557 P2 上电，而 PCA9557 挂在 I2C 上
+       （已在第 5 步初始化）。**失败不致命** —— 界面照常显示，只是拍照不可用，
+       界面上会给出原因。故意用非 ESP_ERROR_CHECK 的写法，避免摄像头成为
+       整机启动的单点故障。 */
+    const esp_err_t cret = camera_service_init();
+    if (cret != ESP_OK) {
+        ESP_LOGW(TAG, "摄像头不可用: %s —— %s（其余功能不受影响）",
+                 esp_err_to_name(cret), camera_service_status());
+    }
+
     /* 7. 先启动网络服务，再创建依赖它的任务。
        顺序很重要：mqtt_task 一启动就会调用 bafa_mqtt_pump()，若此时发送队列
        还没建好，就会走「服务未就绪」分支。虽然 pump 已经改为等待超时，
@@ -790,7 +1034,7 @@ void app_main(void)
     }
 
     /* 8. 建立任务边界 */
-    TaskHandle_t h_ui = NULL, h_mqtt = NULL, h_mon = NULL;
+    TaskHandle_t h_ui = NULL, h_mqtt = NULL, h_mon = NULL, h_sensor = NULL;
 
     BaseType_t ok = xTaskCreatePinnedToCore(ui_task, "ui_task",
                                             APP_TASK_STACK_UI, NULL,
@@ -805,6 +1049,15 @@ void app_main(void)
                                  APP_TASK_CORE_0);
     ESP_ERROR_CHECK(ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     monitor_register("mqtt_task", h_mqtt);
+
+    /* sensor_task（P1 骨架，当前跑模拟数据）。
+       放在 monitor_task 之前创建，这样第一次健康检查就能看到它的栈水位。 */
+    ok = xTaskCreatePinnedToCore(sensor_task, "sensor_task",
+                                 APP_TASK_STACK_SENSOR, NULL,
+                                 APP_TASK_PRIO_SENSOR, &h_sensor,
+                                 APP_TASK_CORE_1);
+    ESP_ERROR_CHECK(ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    monitor_register("sensor_task", h_sensor);
 
     ok = xTaskCreatePinnedToCore(monitor_task, "monitor_task",
                                  APP_TASK_STACK_MONITOR, NULL,

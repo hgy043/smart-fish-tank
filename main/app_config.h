@@ -43,6 +43,55 @@ extern "C" {
 #define THRESHOLD_LUX_MIN           200.0f
 #define THRESHOLD_LUX_MAX           1000.0f
 
+/* 气温 / 湿度阈值 —— **2026-10-13 新增**（Agent.md 第 13 节原表没有）。
+ * 加的理由：鱼缸页有六张卡片，而原来只有五组阈值，导致"气温""湿度"两张卡
+ * 永远不可能告警。告警链要么打通到每一张卡，要么就别在界面上留这种半成品。
+ * 取值是室内养鱼环境的常见舒适区，**不是实测值**；接真传感器后应按实际标定。 */
+#define THRESHOLD_AIR_TEMP_MIN      18.0f
+#define THRESHOLD_AIR_TEMP_MAX      32.0f
+#define THRESHOLD_HUMIDITY_MIN      30.0f
+#define THRESHOLD_HUMIDITY_MAX      80.0f
+
+/* ==========================================================================
+ * 传感器模拟数据（P1 未接入 ADS1115 前的替代方案）
+ *
+ * 背景：ADS1115 不打算购买了，故 P1 的 pH / TDS / 浊度改用**随机游走**
+ * 生成"合理范围内"的数值，让界面与告警链能先跑起来。
+ *
+ * 【为什么是随机游走，不是每次重掷】
+ * 真实传感器读数是**连续变化**的，相邻两次采样差一点。每次重掷会让数值
+ * 在量程内乱跳，看的人会以为程序出了问题（而且告警位会每秒翻转）。
+ * 游走 = 上次的值 + 一个小随机步，再夹到量程内。
+ *
+ * 【量程为何**略超出**阈值】
+ * 这样告警会**偶发**触发 —— 既不永远不触发（那样等于没做），
+ * 也不一直红（那样看不出"恢复正常"这件事）。
+ *
+ * 【步长为什么用"量程的比例"而不是绝对值】
+ * 各个量的量纲差了几个数量级（pH 0.1 与光照 100 lx 不是一回事），
+ * 用同一个比例系数才好一处调完。 */
+#define SIM_WALK_STEP_FRAC          0.020f      /* 单步最大幅度 = 量程 × 该值 */
+
+/* 告警滞回：越界即进告警，但要**回到阈值内一定幅度**才退出。
+ * 不加滞回的话，数值在阈值上下缓慢游走会让告警位每秒翻转 ——
+ * 界面上表现为卡片颜色闪烁，将来还会让 MQTT 告警刷屏。 */
+#define SIM_ALERT_HYST_FRAC         0.080f      /* 退出所需的回内幅度 = 量程 × 该值 */
+
+#define SIM_PH_MIN                  6.3f
+#define SIM_PH_MAX                  7.7f
+#define SIM_WTEMP_MIN               20.0f
+#define SIM_WTEMP_MAX               30.0f
+#define SIM_ATEMP_MIN               18.0f
+#define SIM_ATEMP_MAX               32.0f
+#define SIM_HUM_MIN                 35.0f
+#define SIM_HUM_MAX                 75.0f
+#define SIM_LUX_MIN                 100.0f
+#define SIM_LUX_MAX                 1200.0f
+#define SIM_TURB_MIN                0.0f
+#define SIM_TURB_MAX                30.0f
+#define SIM_TDS_MIN                 80.0f
+#define SIM_TDS_MAX                 600.0f
+
 /* ==========================================================================
  * 任务优先级 / 栈（Agent.md 第 6 节；未实测前禁止随意调整）
  *

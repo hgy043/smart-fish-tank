@@ -190,68 +190,140 @@ static void build_menu_page(lv_obj_t *root)
 }
 
 /* ==========================================================================
- * 小智 AI 互动页（视觉假数据）
+ * 小智 AI 互动页 —— 拍照与照片显示（P6-a 接入真实摄像头）
+ *
+ * 【布局】内容区是 480 × (320-44) = 480 × 276
+ *     照片区   320 × 240   居中靠上（x = 80，y = 0）
+ *     拍照按钮 452 × 32    整宽靠下（y = 242）
+ *   320×240 是**原尺寸直显**，不做任何缩放 —— 本工程 CONFIG_LV_CACHE_DEF_SIZE=0
+ *   （没有图像缓存），LVGL 缩放要每帧软件重算，既费 CPU 又糊。
+ *
+ * 【为什么按钮不做成小圆钮】整宽按钮的命中面积大得多，也不用管对中线。
+ *   状态文字（拍摄中/失败原因）直接写在照片区中央，不额外占纵向空间。
  * ========================================================================== */
+#define AI_PHOTO_W   320
+#define AI_PHOTO_H   240
+#define AI_BTN_H     32
+
+static lv_obj_t *s_ai_photo   = NULL;   /* lv_image：照片本体 */
+static lv_obj_t *s_ai_hint    = NULL;   /* 照片区中央的提示/状态文字 */
+static lv_obj_t *s_ai_btn     = NULL;
+static lv_obj_t *s_ai_btn_lbl = NULL;
+
+/* 拍照请求标志。
+ * ⚠️ 只允许**置位**（在 LVGL 回调里）与**取走**（在 ui_task 锁外轮询），
+ *    任何一侧都不做别的事 —— 耗时动作一律留在锁外。 */
+static volatile bool s_capture_req = false;
+
+static void on_capture_clicked(lv_event_t *e)
+{
+    (void)e;
+    /* 这里跑在 taskLVGL 上下文、**且已持 LVGL 锁**。
+       所以只能置个标志就返回 —— 一旦在这里调 camera_service_capture()，
+       最长 4 秒的阻塞会把整个界面（含触摸）冻住。 */
+    s_capture_req = true;
+}
+
+bool ui_pages_take_capture_request(void)
+{
+    if (!s_capture_req) {
+        return false;
+    }
+    s_capture_req = false;
+    return true;
+}
+
+lv_obj_t *ui_pages_ai_photo(void)
+{
+    return s_ai_photo;
+}
+
+void ui_pages_ai_hint_visible(bool visible)
+{
+    if (s_ai_hint == NULL) {
+        return;
+    }
+    if (visible) {
+        lv_obj_remove_flag(s_ai_hint, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_ai_hint, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void ui_pages_set_ai_status(const char *text, bool button_enabled)
+{
+    if (s_ai_hint != NULL) {
+        if (text != NULL && text[0] != '\0') {
+            lv_label_set_text(s_ai_hint, text);
+            lv_obj_remove_flag(s_ai_hint, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_ai_hint, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (s_ai_btn != NULL) {
+        /* 置灰但仍可见 —— 比直接隐藏更能说明"功能存在但不可用"。
+           用 LVGL 的 DISABLED 状态而不是自己记标志：处于该状态的对象
+           **不会**再派发 CLICKED，所以连点/拍摄中再点都不会进回调。
+           （若只改透明度而不设状态，回调照样触发，得在回调里再判一次。） */
+        if (button_enabled) {
+            lv_obj_remove_state(s_ai_btn, LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(s_ai_btn, LV_STATE_DISABLED);
+        }
+        lv_obj_set_style_bg_opa(s_ai_btn, button_enabled ? LV_OPA_COVER : LV_OPA_50, 0);
+
+        if (s_ai_btn_lbl != NULL) {
+            lv_label_set_text(s_ai_btn_lbl, button_enabled ? "拍照" : "摄像头不可用");
+        }
+    }
+}
+
 static void build_ai_page(lv_obj_t *root)
 {
     lv_obj_t *content = ui_page_make_shell(root, "小智AI互动", true);
 
-    /* --- 对话区：两条气泡，一用户一助手，展示对齐与配色 --- */
-    lv_obj_t *bubble_user = lv_obj_create(content);
-    lv_obj_remove_style_all(bubble_user);
-    lv_obj_remove_flag(bubble_user, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(bubble_user, 260, 56);
-    lv_obj_align(bubble_user, LV_ALIGN_TOP_RIGHT, -TH_MARGIN, 14);
-    lv_obj_set_style_bg_color(bubble_user, lv_color_hex(TH_ACCENT), 0);
-    lv_obj_set_style_bg_opa(bubble_user, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(bubble_user, 12, 0);
+    /* ---- 照片区外框：即使还没拍过照，也能看出"这里会出画面" ---- */
+    lv_obj_t *frame = lv_obj_create(content);
+    lv_obj_remove_style_all(frame);
+    lv_obj_remove_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(frame, (TH_W - AI_PHOTO_W) / 2, 0);
+    lv_obj_set_size(frame, AI_PHOTO_W, AI_PHOTO_H);
+    lv_obj_set_style_bg_color(frame, lv_color_hex(TH_CARD), 0);
+    lv_obj_set_style_bg_opa(frame, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(frame, lv_color_hex(TH_EDGE), 0);
+    lv_obj_set_style_border_width(frame, 1, 0);
 
-    lv_obj_t *u = lv_label_create(bubble_user);
-    lv_label_set_text(u, "鱼缸今天怎么样？");
-    lv_obj_set_style_text_font(u, &font_puhui_16_4, 0);
-    lv_obj_set_style_text_color(u, lv_color_hex(TH_CARD), 0);
-    lv_obj_align(u, LV_ALIGN_LEFT_MID, 12, 0);
+    /* 照片控件：尺寸与 source 一致（320×240），故定位于 (0,0) 即可铺满 */
+    s_ai_photo = lv_image_create(frame);
+    lv_obj_set_pos(s_ai_photo, 0, 0);
 
-    lv_obj_t *bubble_ai = lv_obj_create(content);
-    lv_obj_remove_style_all(bubble_ai);
-    lv_obj_remove_flag(bubble_ai, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(bubble_ai, 300, 76);
-    lv_obj_align(bubble_ai, LV_ALIGN_TOP_LEFT, TH_MARGIN, 82);
-    lv_obj_set_style_bg_color(bubble_ai, lv_color_hex(TH_CARD), 0);
-    lv_obj_set_style_bg_opa(bubble_ai, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(bubble_ai, 12, 0);
-    lv_obj_set_style_border_color(bubble_ai, lv_color_hex(TH_EDGE), 0);
-    lv_obj_set_style_border_width(bubble_ai, 1, 0);
+    /* 中央提示 / 状态文字。多行 + 居中。 */
+    s_ai_hint = lv_label_create(frame);
+    lv_label_set_text(s_ai_hint, "点下方按钮拍照");
+    lv_obj_set_style_text_font(s_ai_hint, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_ai_hint, lv_color_hex(TH_LABEL), 0);
+    lv_obj_set_style_text_align(s_ai_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_ai_hint, AI_PHOTO_W - 24);
+    lv_label_set_long_mode(s_ai_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_center(s_ai_hint);
 
-    lv_obj_t *a = lv_label_create(bubble_ai);
-    lv_label_set_text(a, "水温 25.0℃ 正常，pH 7.00 适宜。\n光照偏低，建议补光 2 小时。");
-    lv_obj_set_style_text_font(a, &font_puhui_16_4, 0);
-    lv_obj_set_style_text_color(a, lv_color_hex(TH_TEXT), 0);
-    lv_obj_set_style_text_line_space(a, 6, 0);
-    lv_obj_align(a, LV_ALIGN_LEFT_MID, 12, 0);
+    /* ---- 底部拍照按钮（整宽）---- */
+    s_ai_btn = lv_obj_create(content);
+    lv_obj_remove_style_all(s_ai_btn);
+    lv_obj_remove_flag(s_ai_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_ai_btn, TH_MARGIN, AI_PHOTO_H + 2);
+    lv_obj_set_size(s_ai_btn, TH_W - 2 * TH_MARGIN, AI_BTN_H);
+    lv_obj_set_style_bg_color(s_ai_btn, lv_color_hex(TH_ACCENT), 0);
+    lv_obj_set_style_bg_opa(s_ai_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_ai_btn, 8, 0);
+    lv_obj_add_event_cb(s_ai_btn, on_capture_clicked, LV_EVENT_CLICKED, NULL);
 
-    /* --- 占位提示 --- */
-    lv_obj_t *note = lv_label_create(content);
-    lv_label_set_text(note, "（以上为界面占位示例，P7 接入小智后显示真实对话）");
-    lv_obj_set_style_text_font(note, &font_puhui_16_4, 0);
-    lv_obj_set_style_text_color(note, lv_color_hex(TH_LABEL), 0);
-    lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, TH_MARGIN, -58);
-
-    /* --- 底部麦克风按钮（视觉元素） --- */
-    lv_obj_t *mic = lv_obj_create(content);
-    lv_obj_remove_style_all(mic);
-    lv_obj_remove_flag(mic, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(mic, 88, 44);
-    lv_obj_align(mic, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(mic, lv_color_hex(0x6A1B9A), 0);
-    lv_obj_set_style_bg_opa(mic, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(mic, 22, 0);
-
-    lv_obj_t *mic_icon = lv_label_create(mic);
-    lv_label_set_text(mic_icon, FONT_AWESOME_MICROPHONE);
-    lv_obj_set_style_text_font(mic_icon, &font_awesome_20_4, 0);
-    lv_obj_set_style_text_color(mic_icon, lv_color_hex(TH_CARD), 0);
-    lv_obj_center(mic_icon);
+    s_ai_btn_lbl = lv_label_create(s_ai_btn);
+    lv_label_set_text(s_ai_btn_lbl, "拍照");
+    lv_obj_set_style_text_font(s_ai_btn_lbl, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_ai_btn_lbl, lv_color_hex(TH_CARD), 0);
+    lv_obj_center(s_ai_btn_lbl);
 }
 
 /* ==========================================================================

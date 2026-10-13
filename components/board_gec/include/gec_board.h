@@ -35,6 +35,25 @@ extern "C" {
 #define GEC_I2C_SCL_GPIO        GPIO_NUM_2
 #define GEC_I2C_FREQ_HZ         100000      /* 100kHz，已验证值 */
 
+/* I2C 端口号 —— **显式指定，不用自动分配（-1）**。
+ *
+ * 2026-10-13 改动。原先是 `.i2c_port = -1`，注释理由是「写死端口号会与同工程内
+ * 的其它 I2C 使用者（SCCB、触摸屏）冲突」—— **这个理由正好说反了**。
+ *
+ * esp32-camera 的 `camera_config_t.sccb_i2c_port` 要的正是**端口号**（int），
+ * 驱动拿它去 `i2c_master_get_bus_handle(port)` 找到**同一条**总线，再
+ * `i2c_master_bus_add_device()` 只挂上自己那个从设备。也就是说：
+ * **写死端口号恰恰是 SCCB 能共享本总线的前提**；端口号是 -1（未定）时，
+ * 摄像头根本无从引用这条总线。
+ *
+ * 见 esp_camera.c:191-197 → sccb-ng.c:147-160：`pin_sccb_sda == -1` 时走
+ * `SCCB_Use_Port()`，它**绝不调用 i2c_new_master_bus**，只记录端口号，
+ * 所以与总线上已有的 PCA9557 / ES8311 / ES7210 / FT6X36 共存是安全的。
+ *
+ * 风险：低。ESP32-S3 有 2 个 I2C 端口，本工程只用一条总线，
+ * 没有任何代码依赖"自动分配的结果恰好是几"。 */
+#define GEC_I2C_PORT_NUM        I2C_NUM_0
+
 /* I2C 从机 7 位地址表（ESP-IDF 新驱动 i2c_master 使用 7 位地址） */
 #define GEC_I2C_ADDR_ES8311     0x18    /* 音频 Codec（默认地址）        */
 #define GEC_I2C_ADDR_ES7210     0x41    /* 音频 ADC（厂家宏写 0x82=8位） */

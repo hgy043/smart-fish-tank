@@ -51,17 +51,21 @@ static const char *TAG = "ui_tank";
 typedef struct {
     const char *name;
     const char *fmt;
-    uint32_t    color;
+    uint32_t    color;      /* 正常时的数值颜色 */
+    uint32_t    alert_bit;  /* 对应 tank_ecosystem_t.alert_mask 的位；0 = 无告警位 */
     uint8_t     col, row;
 } card_def_t;
 
+/* 卡片定义表 —— 建界面与刷新共用，避免两处各写一份列表而在加字段时漏改。
+   alert_bit 取自 app_core/app_types.h 的 ECO_ALERT_*（位定义在那里，
+   阈值仍在 main/app_config.h —— 组件不能依赖 main，分层如此）。 */
 static const card_def_t k_cards[] = {
-    { "pH",   "%.2f",     TH_WATER, 0, 0 },
-    { "水温", "%.1f ℃",   TH_TEMP,  1, 0 },
-    { "气温", "%.1f ℃",   TH_TEMP,  0, 1 },
-    { "湿度", "%.0f %%",  TH_HUM,   1, 1 },
-    { "光照", "%.0f lx",  TH_LUX,   0, 2 },
-    { "浊度", "%.2f NTU", TH_WATER, 1, 2 },
+    { "pH",   "%.2f",     TH_WATER, ECO_ALERT_PH,        0, 0 },
+    { "水温", "%.1f ℃",   TH_TEMP,  ECO_ALERT_WATER_TMP, 1, 0 },
+    { "气温", "%.1f ℃",   TH_TEMP,  ECO_ALERT_AIR_TMP,   0, 1 },
+    { "湿度", "%.0f %%",  TH_HUM,   ECO_ALERT_HUMIDITY,  1, 1 },
+    { "光照", "%.0f lx",  TH_LUX,   ECO_ALERT_LUX,       0, 2 },
+    { "浊度", "%.2f NTU", TH_WATER, ECO_ALERT_TURBIDITY, 1, 2 },
 };
 #define CARD_CNT ((int)(sizeof(k_cards) / sizeof(k_cards[0])))
 
@@ -70,6 +74,13 @@ static const card_def_t k_cards[] = {
  * ========================================================================== */
 static lv_obj_t *s_val[CARD_CNT];
 static char      s_val_cache[CARD_CNT][24];
+
+/* 告警着色状态缓存：-1 = 尚未写入过颜色。
+   与 s_wifi_on / s_mqtt_on 同款做法 —— **只在状态翻转时**才调
+   lv_obj_set_style_text_color()。若每 200ms 无条件 set 一次，
+   LVGL 会把标签标脏并重绘，白白占用 SPI 带宽（本工程单缓冲部分刷新，
+   重绘代价是实打实的）。 */
+static int8_t    s_val_alert[CARD_CNT] = { -1, -1, -1, -1, -1, -1 };
 
 static lv_obj_t *s_ic_wifi = NULL;
 static lv_obj_t *s_ic_mqtt = NULL;
@@ -194,5 +205,17 @@ void ui_dashboard_update(const tank_ecosystem_t *snap)
     for (int i = 0; i < CARD_CNT; i++) {
         snprintf(buf, sizeof(buf), k_cards[i].fmt, (double)card_value(i, snap));
         set_if_changed(s_val[i], s_val_cache[i], sizeof(s_val_cache[i]), buf);
+
+        /* 越界则把数值改成红色。
+           只在**翻转时**写颜色 —— 理由见 s_val_alert 的声明处。 */
+        const bool alerting = (snap->alert_mask & k_cards[i].alert_bit) != 0;
+        if (s_val_alert[i] != (int8_t)alerting) {
+            s_val_alert[i] = (int8_t)alerting;
+            lv_obj_set_style_text_color(
+                s_val[i],
+                lv_color_hex(alerting ? TH_BAD : k_cards[i].color), 0);
+            ESP_LOGD(TAG, "卡片「%s」%s", k_cards[i].name,
+                     alerting ? "进入告警" : "恢复正常");
+        }
     }
 }

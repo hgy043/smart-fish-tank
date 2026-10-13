@@ -430,3 +430,102 @@ bool ui_lvgl_update(const tank_ecosystem_t *snap)
     (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
     return true;
 }
+
+/* ==========================================================================
+ * 摄像头照片显示（P6-a）
+ *
+ * 调用次序见 ui_lvgl.h。这里只强调两条不可动摇的约束：
+ *
+ *   ① **拷贝在锁外**。153 KB 的 memcpy 在 PSRAM 上约几毫秒，
+ *      放在锁内会白白占着 LVGL 锁。本函数把拷贝放在取锁**之前**。
+ *   ② **双缓冲**。交替使用两块缓冲，于是"taskLVGL 正在渲染的那块"
+ *      永远不会被下一帧写到 —— 撕裂从设计上就不可能发生，不靠运气。
+ *      （对照：xiaozhi 的 `Esp32Camera::Capture()` 是单缓冲、在锁外改写
+ *      正在显示的缓冲，它靠的是"不发生"而非"不可能"。）
+ * ========================================================================== */
+
+/* 双缓冲。**按需分配** —— 第一次显示照片时才要这 300 KB PSRAM，
+ * 不拍照的场景不该先占着。 */
+static uint16_t      *s_photo_buf[2] = { NULL, NULL };
+static lv_image_dsc_t s_photo_dsc[2];
+static int            s_photo_cur = -1;     /* -1 = 还没显示过任何照片 */
+
+bool ui_lvgl_capture_requested(void)
+{
+    /* 纯读标志，不碰 LVGL，故**不加锁** —— 见 ui_lvgl.h 的调用次序 */
+    return ui_pages_take_capture_request();
+}
+
+void ui_lvgl_set_ai_status(const char *text, bool button_enabled)
+{
+    if (!s_ready) {
+        return;
+    }
+    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
+        return;
+    }
+    ui_pages_set_ai_status(text, button_enabled);
+    lvgl_port_unlock();
+    (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
+}
+
+esp_err_t ui_lvgl_show_photo(const uint16_t *rgb565, int w, int h)
+{
+    ESP_RETURN_ON_FALSE(s_ready, ESP_ERR_INVALID_STATE, TAG,
+                        "ui_lvgl 未初始化");
+    ESP_RETURN_ON_FALSE(rgb565 != NULL && w > 0 && h > 0, ESP_ERR_INVALID_ARG,
+                        TAG, "照片参数非法");
+    ESP_RETURN_ON_FALSE(w <= UI_LVGL_PHOTO_MAX_W && h <= UI_LVGL_PHOTO_MAX_H,
+                        ESP_ERR_INVALID_SIZE, TAG,
+                        "照片 %dx%d 超过缓冲容量 %dx%d（改摄像头分辨率时"
+                        "记得同步 ui_lvgl_config.h）",
+                        w, h, UI_LVGL_PHOTO_MAX_W, UI_LVGL_PHOTO_MAX_H);
+
+    const size_t bytes = (size_t)UI_LVGL_PHOTO_MAX_W * UI_LVGL_PHOTO_MAX_H
+                         * sizeof(uint16_t);
+
+    /* ---- 按需分配两块缓冲（**锁外**）---- */
+    if (s_photo_buf[0] == NULL) {
+        for (int i = 0; i < 2; i++) {
+            s_photo_buf[i] = (uint16_t *)heap_caps_malloc(
+                                 bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (s_photo_buf[i] == NULL) {
+                ESP_LOGE(TAG, "照片缓冲 %d 分配失败（需 %u 字节 PSRAM）",
+                         i, (unsigned)bytes);
+                return ESP_ERR_NO_MEM;
+            }
+        }
+        ESP_LOGI(TAG, "照片双缓冲就绪：2 × %u 字节（PSRAM）", (unsigned)bytes);
+    }
+
+    /* ---- 写入**另一块**缓冲（**锁外**）---- */
+    const int next = (s_photo_cur + 1) & 1;     /* -1 → 0，0 ↔ 1 交替 */
+
+    memcpy(s_photo_buf[next], rgb565, (size_t)w * h * sizeof(uint16_t));
+
+    /* 描述符也写"另一块"的 —— 它同样不在显示中 */
+    memset(&s_photo_dsc[next], 0, sizeof(s_photo_dsc[next]));
+    s_photo_dsc[next].header.magic  = LV_IMAGE_HEADER_MAGIC;
+    s_photo_dsc[next].header.cf     = LV_COLOR_FORMAT_RGB565;
+    s_photo_dsc[next].header.w      = (uint32_t)w;
+    s_photo_dsc[next].header.h      = (uint32_t)h;
+    s_photo_dsc[next].header.stride = (uint32_t)w * 2;
+    s_photo_dsc[next].data_size     = (uint32_t)((size_t)w * h * 2);
+    s_photo_dsc[next].data          = (const uint8_t *)s_photo_buf[next];
+
+    /* ---- 只在这里持锁：切一次指针（微秒级）---- */
+    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
+        /* 缓冲已经写好了，只是没切过去。**不推进 s_photo_cur** ——
+           下一次会重写同一块，仍不会碰正在显示的那块。 */
+        ESP_LOGW(TAG, "照片已就绪但取锁超时，本轮未切换显示");
+        return ESP_ERR_TIMEOUT;
+    }
+    lv_image_set_src(ui_pages_ai_photo(), &s_photo_dsc[next]);
+    ui_pages_ai_hint_visible(false);
+    lvgl_port_unlock();
+
+    s_photo_cur = next;         /* 只在切换成功后推进 */
+    (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
+    ESP_LOGI(TAG, "照片已显示：%dx%d（缓冲 %d）", w, h, next);
+    return ESP_OK;
+}

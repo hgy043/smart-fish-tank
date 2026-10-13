@@ -115,6 +115,57 @@ bool ui_lvgl_update(const tank_ecosystem_t *snap);
  */
 void ui_lvgl_flush_probe(uint32_t frames);
 
+/* ==========================================================================
+ * 摄像头拍照（P6-a）
+ *
+ * 调用次序（**这个次序是设计的一部分，不要打乱**）：
+ *
+ *     ui_task:
+ *       if (ui_lvgl_capture_requested()) {          // ① 锁外轮询
+ *           ui_lvgl_set_ai_status("拍摄中…", false); // ② 内部上锁，很快
+ *           camera_service_capture();                // ③ **锁外**，最长 4 秒
+ *           ui_lvgl_show_photo(...);                 // ④ 内部上锁
+ *       }
+ *
+ * 关键点：**拍照本身（③）绝不能持 LVGL 锁** —— 它最长阻塞 4 秒，
+ * 持锁会把 taskLVGL 一起卡住，整个界面（含触摸）冻结。
+ * 所以按钮回调只置标志（①），耗时动作留给锁外的 ui_task。
+ * ========================================================================== */
+
+/**
+ * @brief 【**不加锁**】取走拍照请求。true = 用户按了「拍照」键。
+ * @note  专供 ui_task 在锁外轮询。读取即清零。
+ */
+bool ui_lvgl_capture_requested(void);
+
+/**
+ * @brief 把一帧标准 RGB565 显示到「小智AI互动」页。
+ *
+ * @param rgb565 标准 native RGB565（即 camera_service_frame() 交出的格式），
+ *               尺寸 w×h，行连续。
+ * @param w,h    图像尺寸，必须 ≤ UI_LVGL_PHOTO_MAX_W/H（见 ui_lvgl_config.h）。
+ *
+ * @return ESP_OK；ESP_ERR_INVALID_STATE（未初始化）；ESP_ERR_INVALID_ARG（参数非法）；
+ *         ESP_ERR_INVALID_SIZE（尺寸超缓冲容量）；ESP_ERR_TIMEOUT（取锁超时）。
+ *
+ * @note **双缓冲**：数据先拷进本组件自有的两块缓冲之一（**锁外**完成），
+ *       然后才上锁、只做一次 `lv_image_set_src()` 切换指针。锁持有时间是
+ *       **微秒级**，不是拷 153 KB 的那几毫秒。
+ *       这样做的同时也就满足了「LVGL 正在显示的那块缓冲永远不会被下一帧写」
+ *       —— 交替使用两块即可。若改成单缓冲，就会出现"LVGL 正在读、摄像头正在写"
+ *       的撕裂（xiaozhi 的 `Capture()` 正是单缓冲，靠的是不发生）。
+ *
+ * @warning 传给本函数的源缓冲在返回后即可被调用方复用/覆盖 —— 本函数已拷贝。
+ */
+esp_err_t ui_lvgl_show_photo(const uint16_t *rgb565, int w, int h);
+
+/**
+ * @brief 更新拍照区的状态文字与按钮可用性（内部上锁）。
+ * @param text           照片区中央的提示；NULL 或空串 = 隐藏。
+ * @param button_enabled false = 按钮置灰且点击无效。
+ */
+void ui_lvgl_set_ai_status(const char *text, bool button_enabled);
+
 /**
  * @brief 读取「色彩数据发送完成中断」的累计次数。
  *
