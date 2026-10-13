@@ -1,0 +1,273 @@
+# 系统架构与线程模型
+
+## 1. 分层
+
+```
+┌─ 应用层 (main/) ──────────────────────────────────────────┐
+│  app_main.c    入口、任务创建、全局生态状态、健康检查        │
+│  app_config.h  全部周期/阈值/栈大小（唯一配置源）            │
+└───────────────────────────────────────────────────────────┘
+                          ↓ 只依赖接口
+┌─ 共享组件 ────────────────────────────────────────────────┐
+│  app_core/     事件总线（app_events）+ 数据结构（app_types）│
+│                刻意不依赖 esp_netif / esp_wifi，保持轻量     │
+│  board_gec/    板级：I2C、PCA9557、引脚真源、I2C 扫描       │
+│  net_service/  Wi-Fi 站点 + 巴法云 MQTT（含凭据与主题）      │
+└───────────────────────────────────────────────────────────┘
+                          ↓
+┌─ 待建组件 (components/) ──────────────────────────────────┐
+│  ext_adc/        ADS1115 水质 ADC + 换算                    │
+│  env_sensor/     空气温湿度、光照                            │
+│  camera_vision/  摄像头与识别                                │
+│  audio_service/  ES8311/ES7210 + I2S                        │
+│  voice_assistant/ ESP-skainet                                │
+│  ui_lvgl/        LVGL 界面                                   │
+│  ai_advisor/     小智 AI                                     │
+│  storage/        NVS / TF 卡                                 │
+└───────────────────────────────────────────────────────────┘
+```
+
+> **依赖方向铁律**：`main` → 组件 → `app_core`。
+> 组件之间不得互相依赖，更不得依赖 `main`（否则 CMake 报循环依赖）。
+> 需要跨组件通知时，双方都依赖 `app_core` 的事件总线。
+
+## 2. 任务与核心绑定
+
+| 任务 | 优先级 | 栈(字) | 核心 | 触发 | 职责 | 当前状态 |
+|---|---:|---:|---|---|---|---|
+| `sensor_task` | 5 | 4096 | 1 | 1s | ADS1115 水质、温湿度、光照采集与滤波 | P1 |
+| `vision_task` | 4 | 8192 | 0/1 | 5s | 抓拍、鱼类检测、浑浊识别 | P6 |
+| `voice_task` | 4 | 8192 | 0 | 阻塞等待 | ESP-skainet 唤醒与命令词 | P5 |
+| `audio_task` | 3 | 4096 | 0 | 事件触发 | I2S 播报、提示音 | P4 |
+| `mqtt_task` | 3 | 8192 | 0 | 10s / 事件 | 巴法云上报与订阅 | **P0 已建骨架** |
+| `ui_task` | 2 | 8192 | 1 | 30ms | LVGL 刷新（**LVGL 唯一调用点**） | **P0 已建骨架** |
+| `ai_task` | 2 | 8192 | 0 | 30min / 事件 | 小智 AI 养护建议 | P7 |
+| `monitor_task` | 1 | 3072 | 1 | 10s | 内存、栈高水位、任务健康 | **P0 已建** |
+
+### FreeRTOS 时基警告
+
+`CONFIG_FREERTOS_HZ = 100`，即 **1 tick = 10ms**（实证值，非默认的 1000Hz）。
+
+影响：
+- `vTaskDelay` 的最小有效步进是 10ms，`pdMS_TO_TICKS(5)` 会得到 0。
+- `APP_UI_REFRESH_PERIOD_MS = 30` 不是 10 的整数倍，`pdMS_TO_TICKS(30)` 会取整。
+  因此 `ui_task` 使用 `vTaskDelayUntil` 按绝对节拍推进，避免误差累积。
+- 新增任何周期常量都必须是 10 的整数倍。
+
+## 3. 同步机制
+
+| 机制 | 用途 | 状态 |
+|---|---|---|
+| `app_events` 事件总线 | 传感器/视觉/语音/网络 → UI/MQTT/AI 的跨任务投递 | P0 已实现 |
+| `i2c_mutex` | I2C 总线互斥（board_gec 内部） | P0 已实现 |
+| `s_eco_mutex` | 全局生态状态读写互斥（app_main 内部） | P0 已实现 |
+| MQTT 发送队列 | 其它任务 → `mqtt_task` 的发布解耦 | P0 已实现 |
+| `sensor_queue` | 高频传感器数据到各消费者 | P1 |
+| `vision_queue` | 视觉结果分发 | P6 |
+| `event_group` | 系统/网络/告警状态位 | 已由事件总线覆盖，必要时再加 |
+| `ui_mutex` | LVGL 互斥（跨任务请求刷新时用） | P2 |
+| `i2s_mutex` | I2S 录音/播放分时复用 | P4 |
+
+### 事件总线的线程语义
+
+`esp_event` 的 handler 运行在**事件循环任务**上下文，不是发布者上下文。
+订阅者收到回调后若需耗时处理，必须把数据拷入自己的队列并立即返回，
+禁止在 handler 内做 I2C/SPI 传输、网络请求或 `vTaskDelay`。
+
+`app_events_publish()` 的等待上限为 100ms：事件队列满时记录 `ESP_LOGW` 并
+返回错误，**绝不静默丢弃**。
+
+## 4. 硬性线程边界（不得破坏）
+
+1. **LVGL 只能由 `ui_task` 调用。** 其它任务要改界面，必须发事件或队列。
+2. **MQTT 发布只能由 `mqtt_task` 执行。** `sensor_task` 禁止直接发 MQTT。
+3. 禁止跨任务直接操作外设，共享资源一律经队列/互斥/事件。
+4. 中断内禁止耗时操作。
+5. 禁止忽略 ESP-IDF API 返回值。
+
+## 5. 启动顺序（app_main）
+
+```
+NVS 初始化
+  → 事件总线初始化（必须先于任务创建，否则任务启动即发布事件时会失败）
+  → 板级 I2C 初始化（board_gec）
+  → 外设自检（I2C 扫描 + 关键器件存在性）
+  → 创建 ui_task / mqtt_task / monitor_task
+  → 输出内存报告
+```
+
+自检失败不阻止任务启动，以便通过串口诊断——这是刻意的设计选择。
+
+## 6. 已知未解决风险
+
+### 6.1 ⛔ C1 已作废（2026-10-13）
+
+本节原记：**「C1（LCD 与 I2S 争用 IO39/IO40）会直接影响 P2（UI）与 P4（音频）
+能否共存，是本项目最大的架构风险，不得假定其可回避。」**
+
+**该结论已作废 —— C1 从来不存在。** 它是引脚表把 I2S 的 BCLK/WS
+误抄成 LCD 的 DC/MOSI 造成的。实测引脚零重叠：
+
+| 外设 | 占用 GPIO |
+|---|---|
+| LCD | DC=IO39、MOSI=IO40、SCLK=IO41、背光=IO42 |
+| I2S | MCLK=IO38、BCLK=**IO14**、WS=**IO13**、DIN=IO12、DOUT=IO45 |
+
+**P2（UI）与 P4（音频）可以共存**，且 2026-10-13 已实测「屏幕出图 + 喇叭放声」同时正常。
+
+> 完整证据链与教训见
+> **[2026-10-13-lcd-audio-report.md](2026-10-13-lcd-audio-report.md)** 与
+> [pinmap.md 8.0i](pinmap.md#80i-2026-10-13-重大更正必须与-80a-连读)。
+
+### 6.2 仍然开放的事项
+
+| 项 | 说明 |
+|---|---|
+| **I2S DIN（D2）** | 按 IO12 实现，待用 `audio_service_measure_mic()` 测 RMS 验证 |
+| **ADS1115 未接入** | P1 水质采集前必须接上并确认能被扫描到（0x48） |
+| ✅ ~~像素时钟~~ | 已裁决：**80 MHz**（2026-10-13 实测通过）。至此 LCD 与参考工程无未解释差异 |
+| ✅ ~~D1（LED 引脚）~~ | 已裁决：IO10，本项目放弃板载 LED |
+
+## 7. 实测踩坑记录（避免重复）
+
+> **📌 2026-10-13 补注**：下面 7.3 / 7.4 / 7.5 三条都写于 LCD 排查期间，
+> 当时「屏幕始终全黑」这一前提**已被后续实测推翻**（真因是背光极性记反 +
+> 面板颜色字段顺序非标准）。三条记录中的**方法论教训仍然成立且值得保留**，
+> 但它们对「哪个参数是对的」的具体判断已过时 —— 以
+> **[2026-10-13-lcd-audio-report.md](2026-10-13-lcd-audio-report.md)** 为准。
+
+### 7.1 服务未就绪时的忙等会淹没日志
+
+P0 首次烧录出现每 10ms 一条 `pump 返回 ESP_ERR_INVALID_STATE`，根因有两层：
+
+1. `bafa_mqtt_pump()` 在发送队列尚未创建时**立刻返回**，没有等待超时，
+   于是 `mqtt_task` 全速空转；
+2. `mqtt_task` 对每个非 `ESP_OK` 返回都打 `ESP_LOGW`，把正常的状态波动
+   当成异常刷屏。
+
+**修法**：① `pump` 在未就绪时也吃满超时（`vTaskDelay`）；
+② 调用方只对真正的意外告警，并加 10 秒节流；
+③ `app_main` 里把服务启动提到任务创建之前，从源头消除该窗口。
+
+**通用教训**：阻塞式 API 的「未就绪」分支必须仍然消费它的超时，
+否则调用方会变成忙等循环；日志要能区分「异常」与「正常波动」。
+
+### 7.2 esp_codec_dev 的通道启停不是幂等的（导致「喇叭只响一次」）
+
+`esp_codec_dev` 的平台层 `_i2s_drv_enable()` 直接调 IDF 接口而**不做状态检查**：
+
+```c
+if (enable)  ret = i2s_channel_enable(channel);
+else         ret = i2s_channel_disable(channel);
+return ret == ESP_OK ? ESP_CODEC_DEV_OK : ESP_CODEC_DEV_DRV_ERR;
+```
+
+而 IDF 的 `i2s_channel_disable()` 在通道未启用时返回 `ESP_ERR_INVALID_STATE`。
+于是 `open → close → open` 循环必然失败，实测现象就是**喇叭只响第一次**：
+
+```
+E i2s_common: i2s_channel_disable: the channel has not been enabled yet
+I Adev_Codec: Open codec device OK
+E i2s_common: i2s_channel_enable: the channel has already enabled
+```
+
+**规避方法**：让 codec 通路**常开**，需要静音时只切功放使能（PCA9557 P1），
+不要反复 `esp_codec_dev_open/close`。代价是 I2S 与 MCLK 持续运行（约几十 mW）。
+
+**通用教训**：用第三方库前先读它**怎么调底层 API**。
+「库的接口看起来幂等」不等于「实现是幂等的」——这里 `open()` 与 `close()`
+成对调用的直觉是错的。
+
+### 7.3 LCD 参数不能靠"抄某一套代码"
+
+三套代码对同一块板、同一颗 ST7796 的 SPI 模式互不一致（06 BSP 用**模式 3**，
+xiaozhi 用**模式 0**），且都没能让屏出图。模式 0/3 采样边沿相反。
+
+**正确处理**：把不确定的参数做成**可扫描的集合**，一次烧录逐个实测
+（`lcd_sweep_selftest()`），而不是在多个"看起来都对"的候选里挑一个赌。
+扫描的代价是观察者盯着屏幕一分钟，远低于反复烧录试错。
+
+### 7.4 整帧 PSRAM 缓冲会让 SPI 驱动在内部 RAM 再分配等长拷贝
+
+**现象**：扫描自检的 8 个组合**全部**报同一个错；回看日志发现
+**第一次 `lcd_init()` 之后正常，一进扫描就全错**：
+
+```
+E spi_master: setup_dma_priv_buffer(1206): Failed to allocate priv TX buffer
+E lcd_panel.io.spi: panel_io_spi_tx_color(395): spi transmit (queue) color failed
+```
+
+**根因**：`lcd_fill()` 走 307KB 的 PSRAM 全屏缓冲、一次发整帧；而
+`lcd_draw_color_bars()` 走 15KB 条带路径。两条路径行为不同，于是表现为
+「有时能画、有时不能」。IDF 的 `setup_dma_priv_buffer()` 逻辑是
+（`esp_driver_spi/src/gpspi/spi_master.c`）：
+
+```c
+bool need_malloc = is_ptr_ext ? (!use_psram || !esp_ptr_dma_ext_capable(buffer))
+                              : !esp_ptr_dma_capable(buffer);
+if (need_malloc) {
+    uint32_t *temp = heap_caps_aligned_alloc(alignment, len, mem_cap);  // len 与源等长
+}
+```
+
+即：缓冲区在 PSRAM 且未置 `SPI_TRANS_DMA_USE_PSRAM` 时，**要在内部 RAM 里
+分配一块与源等长的缓冲**。307KB 的内部分配必然失败（内部 RAM 总共才 361KB）。
+
+**修法**：**不维护全屏帧缓冲**，所有绘制统一走条带路径（每片 480×16×2 = 15KB，
+内部 DMA 内存，且不超过 `max_transfer_sz`）。
+
+**通用教训**：不要为了"少几次调用"引入整帧大缓冲。ESP-IDF 的 SPI DMA 对
+PSRAM 源缓冲有一条隐式内部拷贝路径，代价是**等长的内部 RAM**——这在只有
+几百 KB 内部 RAM 的芯片上不可行。条带绘制反而更稳。
+
+### 7.5 最大教训：**"参照"已验证代码 ≠ "复用"已验证代码**
+
+本项目的 LCD 排查耗了十余轮。根因不是某个参数错，而是**方法论错**：
+
+| 我的做法 | 后果 |
+|---|---|
+| 自己选 SPI 模式（抄 xiaozhi 的 0，而 06 BSP 用 3） | 引入新变量，且两份参考互相矛盾 |
+| 自己定 `max_transfer_sz`（57.6KB） | 触发 SPI 驱动的内部等长拷贝路径 |
+| 自己设计绘制缓冲（307KB 整帧 → 15KB 条带） | 两次都绕过已验证的"逐行 960 字节"路径 |
+| 自己删掉片选步骤（误判"PCA9557 未接拓展"） | 面板从未被选中 → 全黑 |
+| 自己造参数扫描框架 | 在错误的层（SPI 模式没生效）上扫描，白跑 8 组 |
+
+**正确做法**：把已验证的 `bsp_display_new()` / `bsp_lcd_init()` / `lcd_set_color()`
+**逐行照搬**，只在有实测依据处偏离，并明确标注。
+
+**通用教训**：面对"官方/厂家已有可用实现"的场合，
+**复制的成本远低于理解后重写的成本**。
+只有当你已经能证明原实现错在哪里时，才谈优化；
+在此之前，任何"改进"都是在给自己制造未知变量。
+
+### 7.6 内存与栈指标的口径陷阱（P0 阶段实测暴露）
+
+首次上板打印出 `内部堆: 空闲 8579952 / 总计 373107 字节`——空闲是总计的 23 倍。
+两个独立错误：
+
+**错误一：堆口径不一致。**
+`esp_get_free_heap_size()` 返回的是**全部堆**的空闲（内部 RAM + PSRAM），
+而当时拿 `heap_caps_get_total_size(MALLOC_CAP_INTERNAL)` 当"总计"，只有内部 RAM。
+正确配对：
+
+| 想量什么 | 空闲 | 总计 |
+|---|---|---|
+| 内部堆 | `esp_get_free_internal_heap_size()` | `heap_caps_get_total_size(MALLOC_CAP_INTERNAL)` |
+| 全部堆 | `esp_get_free_heap_size()` | 两者相加 |
+| PSRAM | `heap_caps_get_free_size(MALLOC_CAP_SPIRAM)` | `heap_caps_get_total_size(MALLOC_CAP_SPIRAM)` |
+
+**验收判据必须用内部堆**：算上 8MB PSRAM 的全堆余量永远好看（实测 97%），
+会把内部 RAM 的真实压力完全掩盖。内部 RAM 才是稀缺资源。
+
+**错误二：栈单位搞错。**
+`uxTaskGetStackHighWaterMark()` 在 **ESP-IDF 中返回字节**，不是标准 FreeRTOS
+文档所说的"字"。IDF 的 `task.h` 原文：
+
+> "the minimum free stack space there has been **in bytes**
+>  (as opposed to words in the standard FreeRTOS documentation)"
+
+把它当字打印会让读数看着宽裕 4 倍，正好把「栈要爆了」误判成「很安全」。
+
+**通用教训**：打印比值/百分比时，分子分母必须来自**同一口径的 API**；
+核对第三方 API 的单位时，以**该 SDK 的头文件注释**为准，不要凭 FreeRTOS
+通用文档推断——厂商常改语义。

@@ -1,0 +1,105 @@
+# ============================================================================
+# sdkconfig.defaults — 智能鱼缸项目默认配置
+#
+# 所有取值均来自已验证工程的构建产物 (build/config.env 记录 IDF 5.5.3)，
+# 不是猜测值。修改此文件后需执行 idf.py reconfigure 或删除 build 目录。
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 目标芯片与存储
+# ---------------------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# ---------------------------------------------------------------------------
+# 芯片运行频率
+#
+# ⚠️ 实测对齐：粤嵌官方例程 06-tcp_client_bafa_mqtt 的 sdkconfig 用 **240MHz**，
+# 而本工程此前是 IDF 默认的 160MHz。该例程在同一块板上 LCD **能正常出图**，
+# 而本项目不能 —— 在排除其他差异前，先把这项对齐，减少变量。
+#
+# 参考：`D:\ESP32\06-tcp_client_bafa_mqtt\sdkconfig`
+#   CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+#   CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+# ---------------------------------------------------------------------------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# 闪存模式对齐参考工程（QIO）
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+
+# 电源管理 IRAM 优化（参考工程启用，本项目此前未启用）
+CONFIG_PM_SLEEP_FUNC_IN_IRAM=y
+CONFIG_PM_SLP_IRAM_OPT=y
+
+# ---------------------------------------------------------------------------
+# PSRAM：必须为 Octal 模式 @80MHz
+#   ESP32-S3-WROOM-1-N16R8 的 R8 后缀表示 8MB Octal PSRAM。
+#   摄像头帧缓冲、LVGL 绘制缓冲都依赖它，配置错误会直接启动失败。
+# ---------------------------------------------------------------------------
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# ---------------------------------------------------------------------------
+# FreeRTOS 时基
+#   100Hz => 1 tick = 10ms。
+#   硬性影响：vTaskDelay 的最小有效单位是 10ms，所有任务节拍必须是 10ms
+#   的整数倍；ui_task 要求的 30ms 刷新周期需用 vTaskDelayUntil 累积实现。
+# ---------------------------------------------------------------------------
+CONFIG_FREERTOS_HZ=100
+
+# ---------------------------------------------------------------------------
+# 分区表
+# ---------------------------------------------------------------------------
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_PARTITION_TABLE_MD5=y
+
+# ---------------------------------------------------------------------------
+# 编译期质量门禁
+#
+# 本项设为 n 后，实际生效的编译标志为（已由 build/compile_commands.json 核实）：
+#   -Wall -Werror -Wextra
+#   -Wno-error=unused-function -Wno-error=unused-variable
+#   -Wno-error=unused-but-set-variable -Wno-error=deprecated-declarations
+#   -Wno-error=extra -Wno-unused-parameter -Wno-sign-compare
+#   -Wno-enum-conversion -Wno-old-style-declaration
+#
+# 【实测结论，勿轻信猜测】IDF 会**无条件**把一批常见警告排除在 -Werror 之外
+# （unused-variable、unused-function、extra、deprecated-declarations 等），
+# 本项开关**不会**改变这一点。已用「故意定义一个未使用静态变量」验证：
+# 只报 warning，构建仍然成功。
+#
+# 因此本项的真实作用是：让 IDF 默认列表之外的其它警告以错误形式中断构建。
+# 要真正捕获「未使用变量」这类问题，必须**人工检查构建日志中的 warning**，
+# 或按下面的做法让组件自己强制：
+#
+#   set_source_files_properties(app_main.c PROPERTIES
+#       COMPILE_OPTIONS "-Werror=unused-variable;-Werror=unused-function")
+#
+# 本项目当前依赖「构建后人工核对 warning 数量为 0」，尚未逐文件加固。
+# ---------------------------------------------------------------------------
+CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=n
+
+# ---------------------------------------------------------------------------
+# 网络（Wi-Fi / lwIP）
+#
+# ⚠️ 实测教训：MQTT 的缓冲与任务栈**不能**在这里配。
+#   CONFIG_MQTT_BUFFER_SIZE / CONFIG_MQTT_TASK_STACK_SIZE 等项在
+#   ESP-IDF 里都 `depends on MQTT_USE_CUSTOM_CONFIG`（默认 n），
+#   写在 sdkconfig.defaults 里会被 kconfig **静默忽略**，不报任何错。
+#   必须在 esp_mqtt_client_config_t 的 .buffer.size / .task.stack_size
+#   里设置 —— 见 components/net_service/bafa_mqtt.c。
+#   排查方法：配置写完一定要回头 grep 生成的 sdkconfig 确认真的生效了。
+# ---------------------------------------------------------------------------
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+# 巴法云走明文 TCP 9501，不需要 TLS；如需 9503 加密端口再打开
+CONFIG_MQTT_PROTOCOL_311=y
+CONFIG_MQTT_TRANSPORT_SSL=n
+CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
+# lwIP socket 数：MQTT + 后续 HTTP(AI/OTA) + DNS 并发，默认 10 偏紧
+CONFIG_LWIP_MAX_SOCKETS=16

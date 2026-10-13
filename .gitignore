@@ -1,0 +1,29 @@
+# ============================================================================
+# .gitignore — 智能鱼缸项目
+# ============================================================================
+
+# --- 构建产物 ---
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# --- 设备凭据（真机 Wi-Fi 密码 / 巴法云私钥，绝不能入库）---
+# ⚠️ 2026-10-13 启用：建库前该规则是**注释状态**，而 app_secrets.h 里是真实凭据。
+#    已取消注释，并新增 app_secrets.example.h 作为可入库的模板。
+components/net_service/include/app_secrets.h
+secrets.h
+*.secret
+
+# --- IDE ---
+.vscode/
+.idea/
+.cache/
+.clangd
+compile_commands.json
+
+# --- 操作系统 ---
+Thumbs.db
+desktop.ini
+.DS_Store

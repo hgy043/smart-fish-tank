@@ -1,0 +1,10 @@
+## 本工程使用 ESP-IDF 组件管理器
+## 说明：这里锁定的是**用户已验证可运行**的版本 —— 见
+##       xiaozhi-esp32-1.9.4-gec/managed_components/espressif__esp_codec_dev
+## 若构建环境离线导致拉取失败，可改为把该目录直接复制到
+## smart-fish-tank/components/espressif__esp_codec_dev（去掉 idf_component.yml 即可自包含）。
+dependencies:
+  idf:
+    version: '>=5.3'
+  espressif/esp_codec_dev:
+    version: '~1.4.0'
