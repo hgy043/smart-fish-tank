@@ -23,6 +23,14 @@ secrets.h
 .clangd
 compile_commands.json
 
+# --- 求职材料（个人材料，不属于工程内容）---
+# ⚠️ 2026-10-14 启用：本仓库公开后，这两份简历材料决定不随代码发布。
+#    它们描述的是"我做过什么、被问到该怎么答"，与工程文档不是同一类东西；
+#    公开后也会被搜索引擎与快照缓存，撤不干净。
+#    它们仍留在本地工作区，**若日后想公开，删掉下面两行即可**。
+docs/resume-entry.md
+docs/project-narrative.md
+
 # --- 操作系统 ---
 Thumbs.db
 desktop.ini
