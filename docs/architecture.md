@@ -53,12 +53,11 @@
 | `taskLVGL` | 2 | 7168 | 1 | 33ms | LVGL 渲染循环（由 esp_lvgl_port 创建并持有递归锁） |
 | `monitor_task` | 1 | 4096 | 1 | 10s | 内存、栈高水位、任务健康 |
 
-> ⚠️ **2026-10-14 更正**：本表此前是 P0 阶段的**规划表**，与实现不符 ——
-> 其中 `vision_task` / `audio_task` / `ai_task` **三个任务从未创建**；
-> 而实现里真实存在的 `play_task` / `xz_client` / `xz_tool` 三个不在表内。
-> 栈大小也全是当初的预留值（`voice_task` 实测爆栈后升到 26624，
-> `ui_task` / `mqtt_task` 按实测水位从 8192 收到 6144）。
-> 现按实现更正。**逐项真值以 [`main/app_config.h`](../main/app_config.h) 为准**，
+> ⚠️ **2026-10-14 更正**：本表此前是 P0 阶段的**任务规划表**，与实现有出入 ——
+> 规划里的一些任务后来没有创建，而实现里真实存在的 `play_task` / `xz_client` /
+> `xz_tool` 当时不在表内；栈大小也全是预留值（`voice_task` 实测爆栈后升到 26624，
+> `ui_task` / `mqtt_task` 按实测水位从 8192 收到 6144）。**现按实现更正。**
+> 逐项真值以 [`main/app_config.h`](../main/app_config.h) 为准，
 > 汇总见 [`peripherals-and-pitfalls.md`](peripherals-and-pitfalls.md) 第 3.1 节。
 
 ### FreeRTOS 时基警告
