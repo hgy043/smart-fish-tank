@@ -57,9 +57,29 @@ AI 还能反过来**调用设备上的工具**读实时数据、控制摄像头�
 ### 依赖
 
 - Windows + PowerShell
-- ESP-IDF **v5.5.3**，装在 `C:\Espressif`（本机同时装有 5.1.2 / 5.2.2，
-  `build.ps1` 负责锁定 5.5.3 —— **不要直接调 `idf.py`**）
-- 组件依赖由 ESP-IDF 组件管理器自动拉取（见 `main/idf_component.yml`）
+- **ESP-IDF v5.5.3**（本机同时装有 5.1.2 / 5.2.2，`build.ps1` 负责锁定 5.5.3
+  —— **不要直接调 `idf.py`**，那样用的是 PATH 上碰巧先命中的那个版本）
+
+  ⚠️ **`build.ps1` 里的 IDF 安装路径是硬编码成 `C:\Espressif` 的**，
+  装在别处会以 `ESP-IDF 环境加载失败，IDF_PATH=` 报错。要改的**共 4 处**：
+
+  | 行 | 内容 |
+  |---|---|
+  | 26 | `$env:IDF_TOOLS_PATH = 'C:\Espressif'` |
+  | 37 | `$env:PATH = 'C:\Espressif\python_env\...;C:\Espressif\tools\idf-python\...'` |
+  | 44 | `& 'C:\Espressif\frameworks\esp-idf-v5.5.3\export.ps1'` |
+  | 46 | `if ($env:IDF_PATH -ne 'C:\Espressif\frameworks\esp-idf-v5.5.3')` |
+
+  （第 37、44、46 行除根目录外还含**版本号**，换版本时一并改。）
+  没有其它地方引用该路径。
+
+- ⚠️ **首次构建需要联网**。7 个组件依赖由 ESP-IDF 组件管理器从网上拉取：
+  `esp_codec_dev` / `lvgl` / `esp_lvgl_port` / `78/xiaozhi-fonts` /
+  `esp32-camera` / `78/esp-opus-encoder` / `esp_websocket_client`
+  （见 [`main/idf_component.yml`](main/idf_component.yml)）。
+  拉下来的东西落在 `managed_components/`，**已被 `.gitignore` 排除** ——
+  所以**克隆到一个离线环境会卡在第一步**。
+  同样不入库的还有 `build/`、`sdkconfig`、`dependencies.lock`，都由本机构建时生成。
 
 ### ⚠️ 首次构建前必须先做这一步
 
