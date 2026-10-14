@@ -36,9 +36,14 @@ extern "C" {
  * @brief 初始化 SPI 总线、面板 IO、ST7796 面板与背光 PWM。
  * @note  依赖 gec_board_i2c_init() 已执行（片选经 PCA9557 P0，需 I2C）。
  *        内部已完成：SPI3 模式3、BSP_LCD_RST=NC、
- *        **RGB**（实测裁决，非 BGR）+ invert_color(true) + swap_xy(true)
- *        + mirror(true,true)，MADCTL 终值 **0xE0**、
+ *        **BGR**（`LCD_RGB_ELEMENT_ORDER_BGR`）+ invert_color(true) + swap_xy(true)
+ *        + mirror(true,true)，MADCTL 终值 **0xE8**、
  *        以及**拉低 PCA9557 P0 选中面板**（这一步曾漏掉，是早期全黑的根因）。
+ *
+ * @note  颜色的两条**缺一不可**：上面的 BGR **且**每个 16 位像素送面板前
+ *        做字节交换（见 lcd_draw_bitmap() 与 panel_send()）。
+ *        此处曾写「RGB（实测裁决，非 BGR）… MADCTL 终值 0xE0」—— 那是
+ *        2026-10-13 中途的错判，**已于同日推翻**，别再照它改回去。
  *
  * @warning 背光**高电平点亮**（LCD_BL_INVERT=1，实测裁决）。
  *          像素时钟 **80MHz**（2026-10-13 由 40MHz 改回，已实测通过）——
@@ -116,9 +121,11 @@ esp_err_t lcd_draw_progress_bar(int y, int height, uint16_t color);
  *       真正的完成信号由 panel IO 的 on_color_trans_done（中断）异步给出，
  *       经 lcd_set_flush_done_cb() 注册的钩子转达。
  *
- * @note 本函数**不修改** pixels（历史版本曾就地重排字段，现已废除）。
- *       但「DMA 完成前调用方不得复用该缓冲」这条约束**依然成立** ——
- *       它是完成钩子存在的理由，与是否改写无关。
+ * @note 本函数**会就地改写** pixels（`panel_send()` 逐像素交换字节）——
+ *       与上方 @param 的 ⚠️ 是同一件事。此处曾写「本函数**不修改** pixels」，
+ *       那是字段重排被废除时改漏的一处，**与实现相反**。
+ *       「DMA 完成前调用方不得复用该缓冲」这条约束**依然成立** ——
+ *       它是完成钩子存在的理由，与是否改写无关（DMA 正在读它）。
  *
  * @note 本函数不做内部加锁（与 lcd_display 既有约定一致）。
  *       LVGL 端口在它自己的递归锁内串行调用，天然满足「单一绘制者」；

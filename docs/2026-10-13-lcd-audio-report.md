@@ -281,8 +281,8 @@ IO39/IO40 当时是空的，I2S 才碰巧能用。
 | RST | **NC** | 复位走软件命令 |
 | CS | **PCA9557 P0**（不在 GPIO 上） | 低有效；`lcd_init()` 里显式拉低，**这一步曾是全黑根因** |
 | 背光 | IO42，LEDC ch0/timer1/10bit/5kHz，**高电平点亮** | |
-| MADCTL 终值 | **0xE0** | MV\|MX\|MY，BGR 位 = 0 |
-| 送色 | **必须经 `panel_encode()`** | 面板字段顺序为 R, B, G |
+| MADCTL 终值 | **0xE8** | 方向位 MV\|MX\|MY = 0xE0，加 BGR 位 0x08 |
+| 送色 | 标准 RGB565 → **`panel_send()` 字节交换** | `rgb_ele_order = BGR`；`panel_encode()` 已废除 |
 
 ### 6.2 音频（可用）
 
