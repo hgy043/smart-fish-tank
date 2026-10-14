@@ -61,6 +61,19 @@ AI 还能反过来**调用设备上的工具**读实时数据、控制摄像头�
   `build.ps1` 负责锁定 5.5.3 —— **不要直接调 `idf.py`**）
 - 组件依赖由 ESP-IDF 组件管理器自动拉取（见 `main/idf_component.yml`）
 
+### ⚠️ 首次构建前必须先做这一步
+
+**设备凭据文件不在仓库里**（`app_secrets.h` 已被 `.gitignore` 排除，见下方「配置与凭据」）。
+直接 `build` 会以 `app_secrets.h: No such file or directory` 失败。先复制模板：
+
+```powershell
+Copy-Item components\net_service\include\app_secrets.example.h `
+          components\net_service\include\app_secrets.h
+```
+
+**只想看它能不能编译**：模板里的占位符是合法字符串，**照原样复制即可编译通过**，
+不必填真实 Wi-Fi / 巴法云凭据（那样只会连不上网，不影响编译）。
+
 ### 构建与烧录
 
 ```powershell
