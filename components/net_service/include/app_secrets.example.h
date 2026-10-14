@@ -54,13 +54,21 @@ extern "C" {
  *   - 发布 <topic>/set      → 向所有订阅者推送（发布者自己不收，防自循环）
  *   - 发布 <topic>/up       → 只更新云端数据，不推送（省流量，适合高频上报）
  *
- * ⚠️ 这些主题名必须先在巴法云控制台创建，否则发布无效。
+ * ⚠️ 这些主题名必须先在巴法云控制台创建，否则发布无效 ——
+ *    而且**发布不会报错**，串口上一切正常，只是云端什么也收不到。
+ *    换主题名时务必对着控制台逐字核对。
  * ========================================================================== */
-#define BAFA_TOPIC_SENSOR       "fishsensor"   /* 上报完整生态状态 JSON → 用 /up */
-#define BAFA_TOPIC_ALERT        "fishalert"    /* 上报告警              → 用 /set */
-#define BAFA_TOPIC_AI           "fishai"       /* 上报 AI 建议          → 用 /set */
-#define BAFA_TOPIC_STATUS       "fishstatus"   /* 设备在线状态          → 用 /set */
-#define BAFA_TOPIC_CMD          "fishcmd"      /* 订阅控制命令          ← 订阅本主题 */
+/* 【2026-10-14】五个主题**名即所用**，代码不再往上拼 /up 或 /set 后缀。
+ * 原先拼后缀那套已删 —— 名字与控制台对不上时，故障表现是
+ * "串口说已发布、云端消息是空的"，很难查。
+ *
+ * ⚠️ 想省流量可以把传感器那条改成 "sensor/up"（巴法云语义：只更新云端数据、
+ *    不推送，适合高频上报）。但要先确认控制台能显示 /up 写进去的数据。 */
+#define BAFA_TOPIC_SENSOR       "sensor"    /* 上报完整生态状态 JSON（鱼缸六项数据）*/
+#define BAFA_TOPIC_ALERT        "alert"     /* 上报告警                             */
+#define BAFA_TOPIC_AI           "ai"        /* 上报 AI 建议                         */
+#define BAFA_TOPIC_STATUS       "status"    /* 设备在线状态（上线通告 / 离线遗嘱）  */
+#define BAFA_TOPIC_CMD          "set"       /* 订阅控制命令                         */
 
 /* 订阅用主题（接收手机下发的控制命令） */
 #define BAFA_SUBSCRIBE_TOPIC    BAFA_TOPIC_CMD

@@ -1522,6 +1522,13 @@ static void ui_task(void *arg)
         if (s_alert_msg_ready) {
             s_alert_msg_ready = false;
             ui_lvgl_chat_add(UI_CHAT_SYSTEM, s_alert_msg);
+
+            /* 同时上报到巴法云。
+               ⚠️ 2026-10-14 之前这里**只喂了屏幕** —— `bafa_mqtt_post_alert()`
+               写了却一个调用者都没有，所以"远程查看告警"这件事从来没有真正
+               成立过：人不在设备跟前就永远不知道出过告警。
+               投递是入队（非阻塞），不会拖住 ui_task。 */
+            (void)bafa_mqtt_post_alert(s_alert_msg);
         }
 
         /* 界面数据不需要 30ms 这么密：读快照本身很便宜，但每次写入标签
@@ -1936,8 +1943,9 @@ void app_main(void)
     monitor_register("monitor_task", h_mon);
 
     ESP_LOGI(TAG, "P0 启动完成：%d 个任务运行中", s_monitored_cnt);
-    ESP_LOGI(TAG, "巴法云主题: 上报=%s/up  命令=%s",
-             BAFA_TOPIC_SENSOR, BAFA_SUBSCRIBE_TOPIC);
+    ESP_LOGI(TAG, "巴法云主题: 状态=%s  告警=%s  AI=%s  设备=%s  命令=%s",
+             BAFA_TOPIC_SENSOR, BAFA_TOPIC_ALERT, BAFA_TOPIC_AI,
+             BAFA_TOPIC_STATUS, BAFA_SUBSCRIBE_TOPIC);
     log_memory_report();
 
     /* app_main 返回后由 FreeRTOS 回收其任务，业务全部由上述任务承担 */

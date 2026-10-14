@@ -44,22 +44,19 @@ static volatile bool s_connected = false;
 static volatile bool s_ready     = false;   /* 队列与客户端是否已初始化完成 */
 static uint32_t      s_backoff_ms = BAFA_BACKOFF_MIN_MS;
 
-/* 主题名映射：索引与 bafa_msg_kind_t 对齐 */
+/* 主题名映射：索引与 bafa_msg_kind_t 对齐。
+ *
+ * 【2026-10-14】原先这里还有一张 k_use_set_suffix[] 表，由 build_topic()
+ * 往主题名后面拼 /up 或 /set。那套已经删掉 —— 拼出来的名字和用户在巴法云
+ * 控制台实际建的主题对不上，而**发布不会因此报错**，串口显示"已发布"、
+ * 云端消息却是空的，排查起来很费劲。现在**主题名即所用**，不再拼任何后缀。
+ * 想省流量的做法见 app_secrets.h 里那段说明（把名字直接写成 "sensor/up"）。 */
 static const char *const k_topics[BAFA_MSG_MAX] = {
     [BAFA_MSG_SENSOR] = BAFA_TOPIC_SENSOR,
     [BAFA_MSG_ALERT]  = BAFA_TOPIC_ALERT,
     [BAFA_MSG_AI]     = BAFA_TOPIC_AI,
     [BAFA_MSG_STATUS] = BAFA_TOPIC_STATUS,
     [BAFA_MSG_RAW]    = BAFA_TOPIC_STATUS,   /* 调试用，落到 status 主题 */
-};
-
-/* 是否需要 /set 或 /up 后缀 */
-static const bool k_use_set_suffix[BAFA_MSG_MAX] = {
-    [BAFA_MSG_SENSOR] = false,   /* 高频上报，用 /up 只更新云端不推送，省流量 */
-    [BAFA_MSG_ALERT]  = true,
-    [BAFA_MSG_AI]     = true,
-    [BAFA_MSG_STATUS] = true,
-    [BAFA_MSG_RAW]    = false,
 };
 
 /* ==========================================================================
@@ -85,13 +82,8 @@ static void build_topic(bafa_msg_kind_t kind, char *out, size_t out_len)
     if (kind >= BAFA_MSG_MAX) {
         kind = BAFA_MSG_STATUS;
     }
-    if (k_use_set_suffix[kind]) {
-        snprintf(out, out_len, "%s/set", k_topics[kind]);
-    } else if (kind == BAFA_MSG_SENSOR) {
-        snprintf(out, out_len, "%s/up", k_topics[kind]);
-    } else {
-        snprintf(out, out_len, "%s", k_topics[kind]);
-    }
+    /* 名字即主题，不拼后缀 —— 见 k_topics[] 上方的说明 */
+    snprintf(out, out_len, "%s", k_topics[kind]);
 }
 
 /* ==========================================================================
@@ -171,9 +163,11 @@ static void bafa_event_handler(void *arg, esp_event_base_t base,
         int msg_id = esp_mqtt_client_subscribe(event->client, BAFA_SUBSCRIBE_TOPIC, 0);
         ESP_LOGI(TAG, "订阅 %s, msg_id=%d", BAFA_SUBSCRIBE_TOPIC, msg_id);
 
-        /* 上线通告 */
+        /* 上线通告。主题名直接用 BAFA_TOPIC_STATUS，**不再手拼后缀** ——
+           上一版就是手拼了 "/set"，与用户控制台里建的主题名对不上，
+           发布无声无息地落到空处。 */
         const char *online = "{\"state\":\"online\"}";
-        esp_mqtt_client_publish(event->client, BAFA_TOPIC_STATUS "/set",
+        esp_mqtt_client_publish(event->client, BAFA_TOPIC_STATUS,
                                 online, 0, 0, 0);
 
         publish_mqtt_event(EVENT_MQTT_CONNECTED, true);
@@ -257,6 +251,18 @@ esp_err_t bafa_mqtt_start(void)
         },
         .session = {
             .keepalive = 60,
+
+            /* 离线遗嘱（LWT）：设备掉线/断电时由**服务器**代发这一条到 status 主题。
+               ⚠️ 没有它的话，设备一断，云端那条 {"state":"online"} 就永远挂在那里 ——
+               远程看到的是"在线"，而实际早就没心跳了。**这比根本没有状态更糟**：
+               一个永远说"在线"的状态位，会让人在真正需要判断的时候做出错误结论。 */
+            .last_will = {
+                .topic   = BAFA_TOPIC_STATUS,
+                .msg     = "{\"state\":\"offline\"}",
+                .msg_len = 0,       /* 0 = 让 MQTT 自己按 strlen 算 */
+                .qos     = 0,
+                .retain  = 0,
+            },
         },
         .network = {
             /* 显式关闭内建自动重连，由本模块的退避定时器接管 */
@@ -383,24 +389,46 @@ esp_err_t bafa_mqtt_post_status(const tank_ecosystem_t *data)
     }
 
     char buf[BAFA_TX_PAYLOAD_MAX];
-    /* 字段名与 Agent.md 第 9 节的协议约定保持一致 */
+
+    /* ⚠️ 这条消息必须**短**，原因见 BAFA_PAYLOAD_SAFE_MAX 的说明。
+     *
+     * 【2026-10-14 压缩过一次】原格式 209 字节（含 vision/status 两个子对象），
+     * 在巴法云上**一条都没显示出来** —— 而串口上一直是"已发布"。
+     * 现在 113 字节（各量取满量程的最坏情况），余量 15 字节。
+     *
+     * 相比 Agent.md 第 9 节的格式，改了两处：
+     *   ① 键名缩短（turbidity→ntu、temp→wt、air_temp→at、hum→hm、lux→lx）
+     *      —— `water`/`env` 两层分组保留，只动叶子名。
+     *   ② **去掉 vision 与 status 两段**。vision 那两个字段
+     *      （fish_count / muddy）本来就是**永远为 0/false** 的假数据
+     *      （P6-a 的识别结果只上了屏，从没回写 s_eco），报上去等于让云端
+     *      显示"缸里 0 条鱼"这种笃定的假话；status 的 wifi/mqtt 在"能收到这条
+     *      消息"这个前提下是冗余的，而 alert 有自己的 alert 主题。 */
     int n = snprintf(buf, sizeof(buf),
         "{\"ts\":%"PRIu32","
-        "\"water\":{\"ph\":%.2f,\"tds\":%.1f,\"turbidity\":%.2f,\"temp\":%.2f},"
-        "\"env\":{\"air_temp\":%.2f,\"hum\":%.1f,\"lux\":%.1f},"
-        "\"vision\":{\"fish_count\":%d,\"muddy\":%s},"
-        "\"status\":{\"wifi\":%s,\"mqtt\":%s,\"alert\":%s}}",
+        "\"water\":{\"ph\":%.2f,\"tds\":%.1f,\"ntu\":%.2f,\"wt\":%.2f},"
+        "\"env\":{\"at\":%.2f,\"hm\":%.1f,\"lx\":%.1f}}",
         data->timestamp,
         data->ph, data->tds_ppm, data->turbidity_ntu, data->water_temp_c,
-        data->air_temp_c, data->air_humidity, data->lux,
-        data->fish_count, data->water_muddy ? "true" : "false",
-        data->wifi_connected ? "true" : "false",
-        data->mqtt_connected ? "true" : "false",
-        data->alert_active ? "true" : "false");
+        data->air_temp_c, data->air_humidity, data->lux);
 
     if (n < 0 || n >= (int)sizeof(buf)) {
         ESP_LOGE(TAG, "状态 JSON 被截断（需要 %d 字节，缓冲 %u）", n, (unsigned)sizeof(buf));
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    /* 长度守卫：超了就**大声报**，但仍然发出去。
+     *
+     * 为什么不是直接拒发：我们并不确知巴法云的真实阈值（实测它落在 18~209 之间，
+     * 128 是最可能的取值）。真值比 128 大的话，拒发就把本来能送到的数据也丢了。
+     * 发出去、同时把"可能被丢"这件事喊出来，是这两个选择里更好的一个。
+     *
+     * 为什么必须由代码来喊：这种故障**完全静默** —— 发布返回成功、串口打"已发布"、
+     * 云端一片空白。人只能靠"我去控制台看了一眼"发现它，而那往往已经是几天后。 */
+    if (n >= BAFA_PAYLOAD_SAFE_MAX) {
+        ESP_LOGE(TAG, "状态 JSON %d 字节，已达/超过巴法云安全上限 %d —— "
+                      "**发布不会报错，但云端很可能静默丢弃**。请压缩字段后再加字段",
+                 n, BAFA_PAYLOAD_SAFE_MAX);
     }
 
     return bafa_mqtt_enqueue(BAFA_MSG_SENSOR, buf);
