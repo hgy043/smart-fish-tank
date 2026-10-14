@@ -49,9 +49,9 @@ dependencies:
   # xiaozhi 本身就是用 ESP-IDF v5.5.3 构建的，与本工程同版本，
   # 所以这套组件组合在同版本上是跑通过的，不是纸面推断。
   #
-  # ⚠️ 调用方注意**内存**：本次接入前实测内部堆余量 38%（129.5KB / 344KB），
-  #    而 esp-sr 的 AFE + WakeNet 峰值要吃掉约 100KB。这是一次显式的押注，
-  #    以 xiaozhi 在同款板上的可行性为依据；上板后必须盯住 monitor_task 的读数。
+  # ⚠️ 接入后必须盯住**内部堆**：常驻 WSS（TLS 会话 + 帧缓冲 + 任务栈）会吃掉
+  #    相当一块内部 RAM —— 内部 RAM（约 337KB）才是本工程最紧的资源。
+  #    上板后看 monitor_task 的读数。
   # ==========================================================================
 
   # Opus 编解码（含 78/esp-opus 本体）。语音上行的格式是
@@ -59,19 +59,8 @@ dependencies:
   78/esp-opus-encoder:
     version: '~2.4.1'
 
-  # 语音前端 esp-sr（AFE + WakeNet 唤醒词）—— **未采用**。
-  #
-  # 2026-10-13 上板实测后放弃：本工程内部堆总共只有 337KB，接入 WebSocket
-  # 客户端（TLS 会话 + 帧缓冲 + 任务栈）后余量已到 29%，而 AFE + WakeNet 的
-  # 峰值要再吃约 100KB。**算术上不够**，与"调优"无关。
-  #
-  # 改用**按键说话**（xiaozhi 自己就有这条路：`NoAudioProcessor` +
-  # `kListeningModeManualStop`），零额外内存开销。
-  # partitions.csv 里的 `model` 分区**保留**：占位不耗资源，
-  # 将来若有人解决了内存问题（或换更大 RAM 的模组）可以直接启用。
-  #
-  # espressif/esp-sr:
-  #   version: '~2.1.5'
+  # 语音输入用**按键说话**（xiaozhi 自己就有这条路：`NoAudioProcessor` +
+  # `kListeningModeManualStop`）—— 零额外内存开销，不需要额外的语音前端组件。
 
   # WebSocket 客户端 —— **不用** xiaozhi 那个 152KB 的自研实现（78/esp-ml307）。
   # 已逐项核对过：握手需要的四个自定义头（Authorization / Protocol-Version /

@@ -12,24 +12,28 @@
 │  app_core/     事件总线（app_events）+ 数据结构（app_types）│
 │                刻意不依赖 esp_netif / esp_wifi，保持轻量     │
 │  board_gec/    板级：I2C、PCA9557、引脚真源、I2C 扫描       │
-│  net_service/  Wi-Fi 站点 + 巴法云 MQTT（含凭据与主题）      │
+│  net_service/  Wi-Fi 站点 + 巴法云 MQTT + SNTP（含凭据）     │
 └───────────────────────────────────────────────────────────┘
                           ↓
 ┌─ 外设 / 功能组件 ─────────────────────────────────────────┐
-│  lcd_display/   ST7796 面板、颜色变换收口、绘制接口          │  ✅ 已验证
-│  audio_service/ ES8311/ES7210 + I2S 全双工                  │  ✅ 已验证
-│  ui_lvgl/       LVGL 移植 + 鱼缸监测界面（P2）               │  ✅ 本期新增
-└───────────────────────────────────────────────────────────┘
-                          ↓
-┌─ 待建组件 (components/) ──────────────────────────────────┐
-│  ext_adc/        ADS1115 水质 ADC + 换算                    │
-│  env_sensor/     空气温湿度、光照                            │
-│  camera_vision/  摄像头与识别                                │
-│  voice_assistant/ ESP-skainet                                │
-│  ai_advisor/     小智 AI                                     │
-│  storage/        NVS / TF 卡                                 │
+│  lcd_display/     ST7796 面板、颜色变换收口、绘制接口        │
+│  esp_lcd_st7796/  面板驱动（自包含副本）                     │
+│  esp_lcd_touch/ + esp_lcd_touch_ft6x36/                     │
+│                   触摸抽象层 + FT6X36 驱动                   │
+│  touch_input/     触摸 → 事件（刻意不依赖 LVGL）             │
+│  ui_lvgl/         LVGL 移植 + 四页界面 ← 唯一接触 LVGL 的组件 │
+│  audio_service/   ES7210 / ES8311 + I2S 全双工               │
+│  opus_codec/      Opus 编解码（上行 16k / 下行 24k）         │
+│  camera_service/  GC0308 DVP 抓帧 + JPEG 编码               │
+│  sd_service/      TF 卡挂载 / 存照片 / 列照片 / 读缩略图     │
+│  font_service/    中文字体：普惠体 + Noto 回退               │
+│  xiaozhi_client/  小智协议层：OTA / WSS / MCP / 视觉上传     │
 └───────────────────────────────────────────────────────────┘
 ```
+
+> ⚠️ **2026-10-14 更正**：本图原为 P0 阶段的分层**规划**，底部有一整块「待建组件」，
+> 而其中多数后来以别的名字建成了、余下的也不再纳入。现按 `components/` 的
+> 实际内容重画，模块职责见 [`README.md`](../README.md)「它是怎么组织的」一节。
 
 > **依赖方向铁律**：`main` → 组件 → `app_core`。
 > 组件之间不得互相依赖，更不得依赖 `main`（否则 CMake 报循环依赖）。
@@ -37,17 +41,25 @@
 
 ## 2. 任务与核心绑定
 
-| 任务 | 优先级 | 栈(字) | 核心 | 触发 | 职责 | 当前状态 |
-|---|---:|---:|---|---|---|---|
-| `sensor_task` | 5 | 4096 | 1 | 1s | ADS1115 水质、温湿度、光照采集与滤波 | P1 |
-| `vision_task` | 4 | 8192 | 0/1 | 5s | 抓拍、鱼类检测、浑浊识别 | P6 |
-| `voice_task` | 4 | 8192 | 0 | 阻塞等待 | ESP-skainet 唤醒与命令词 | P5 |
-| `audio_task` | 3 | 4096 | 0 | 事件触发 | I2S 播报、提示音 | P4 |
-| `mqtt_task` | 3 | 8192 | 0 | 10s / 事件 | 巴法云上报与订阅 | **P0 已建骨架** |
-| `ui_task` | 2 | 8192 | 1 | 30ms 轮询 / 200ms 出数据 | 读 `s_eco` 快照 → 上锁更新 LVGL 控件 | **P2 已接入界面** |
-| `taskLVGL` | 2 | 7168 | 1 | 33ms | LVGL 渲染循环（由 esp_lvgl_port 创建并持有递归锁） | **P2 新增** |
-| `ai_task` | 2 | 8192 | 0 | 30min / 事件 | 小智 AI 养护建议 | P7 |
-| `monitor_task` | 1 | 3072 | 1 | 10s | 内存、栈高水位、任务健康 | **P0 已建** |
+| 任务 | 优先级 | 栈(字节) | 核心 | 触发 | 职责 |
+|---|---:|---:|---|---|---|
+| `sensor_task` | 5 | 4096 | 1 | 1s | 采样与阈值判定（当前为模拟值；接真传感器时只换取值部分） |
+| `voice_task` | 4 | **26624** | 0 | 10ms 空转 / 60ms 帧 | 麦克风 → Opus 编码 → 上行；兼**下行包的唯一消费者** |
+| `mqtt_task` | 3 | 6144 | 0 | 阻塞 500ms + 10s 上报 | 巴法云上报与订阅（**唯一允许调 `esp_mqtt_client_publish` 的地方**） |
+| `play_task` | 3 | 4096 | 0 | 环形缓冲驱动 | 从环形缓冲取 PCM → 扬声器 |
+| `xz_client` | 3 | 6144 | 0 | 事件驱动 | 小智 OTA / WSS / 重连 |
+| `xz_tool` | 3 | 8192 | 0 | 队列驱动 | 慢工具（拍照 + JPEG 编码 + 上传） |
+| `ui_task` | 2 | 6144 | 1 | 30ms 轮询 / 200ms 出数据 | 读 `s_eco` 快照 → 上锁更新 LVGL 控件 |
+| `taskLVGL` | 2 | 7168 | 1 | 33ms | LVGL 渲染循环（由 esp_lvgl_port 创建并持有递归锁） |
+| `monitor_task` | 1 | 4096 | 1 | 10s | 内存、栈高水位、任务健康 |
+
+> ⚠️ **2026-10-14 更正**：本表此前是 P0 阶段的**规划表**，与实现不符 ——
+> 其中 `vision_task` / `audio_task` / `ai_task` **三个任务从未创建**；
+> 而实现里真实存在的 `play_task` / `xz_client` / `xz_tool` 三个不在表内。
+> 栈大小也全是当初的预留值（`voice_task` 实测爆栈后升到 26624，
+> `ui_task` / `mqtt_task` 按实测水位从 8192 收到 6144）。
+> 现按实现更正。**逐项真值以 [`main/app_config.h`](../main/app_config.h) 为准**，
+> 汇总见 [`peripherals-and-pitfalls.md`](peripherals-and-pitfalls.md) 第 3.1 节。
 
 ### FreeRTOS 时基警告
 

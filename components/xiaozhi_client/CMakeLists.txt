@@ -10,8 +10,9 @@
 #   tank_ecosystem_t（MCP 工具的数据源），故 app_core 必须是 REQUIRES；
 #   其余依赖全放 PRIV_REQUIRES，不把 cJSON/websocket 头泄漏给 main。
 #
-# ⚠️ 本组件**暂不依赖 esp-sr / esp-opus** —— 那两个是音频侧（阶段 2/3）的事。
-#    先把 OTA + 握手跑通，再引入吃内存的语音组件，出问题时才能分辨是哪一层的错。
+# 音频编解码（Opus）是 opus_codec 组件的事，本组件**不依赖它** ——
+#    音频经回调接线（xz_on_audio / xz_send_audio）。这条边界让协议层可以
+#    独立验证：先证明连得上、握手过、能收发文本，再谈音频。
 # ============================================================================
 idf_component_register(
     SRCS        "xiaozhi_ota.c" "xiaozhi_ws.c" "xiaozhi_client.c" "xiaozhi_mcp.c"
