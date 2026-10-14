@@ -14,6 +14,10 @@
 # ============================================================================
 [CmdletBinding()]
 param(
+    # ⚠️ 必须显式声明串口参数 —— 见下方 $Port 处那段说明，别删。
+    [Alias('p')]
+    [string]$Port = '',
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$IdfArgs = @('build')
 )
@@ -49,7 +53,25 @@ Write-Host "[build.ps1] IDF_PATH = $env:IDF_PATH" -ForegroundColor Cyan
 Push-Location -Path $PSScriptRoot
 try {
     $ErrorActionPreference = 'Continue'   # 保留 idf.py 的彩色输出与警告
-    idf.py @IdfArgs
+
+    # ------------------------------------------------------------------
+    # ⚠️ 为什么串口要单独接、而不是靠 ValueFromRemainingArguments 透传：
+    #
+    # 在 [CmdletBinding()] 的高级函数里，ValueFromRemainingArguments
+    # **只捕获位置参数，会静默丢弃 `-p COM10` 这样的具名参数**。
+    # 2026-10-14 实测：`.\build.ps1 -p COM99 flash` 里 COM99 根本没到
+    # idf.py，它退回去自动扫描串口并挑中了 COM11 —— **不报任何错**。
+    # 后果是"你以为在烧 COM10，实际烧的是另一个口（可能是另一块板）"。
+    #
+    # 故 -p/-Port 显式声明（见 param 块），在这里拼回命令行。
+    # ------------------------------------------------------------------
+    $allArgs = @($IdfArgs)
+    if ($Port) {
+        Write-Host "[build.ps1] 串口 = $Port" -ForegroundColor Cyan
+        $allArgs = @('-p', $Port) + $allArgs
+    }
+
+    idf.py @allArgs
     $code = $LASTEXITCODE
 } finally {
     Pop-Location
