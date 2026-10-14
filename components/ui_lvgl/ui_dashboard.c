@@ -28,8 +28,12 @@
 
 #include "font_awesome.h"
 
-LV_FONT_DECLARE(font_puhui_20_4);   /* 数值 */
-LV_FONT_DECLARE(font_puhui_16_4);   /* 标签 */
+/* 中文字体：**不要直接引用 `&font_puhui_16_4` / `&font_puhui_20_4`**。
+ * 那是子集化的普惠体（CJK 只有 5258 个），AI 回复里偶尔会出现字集外的汉字。
+ * `font_service_*()` 返回的是同一套普惠体 **外加 Noto 回退**的 RAM 副本 ——
+ * 理由与两个必须知道的约束见 font_service.h 顶部。 */
+#include "font_service.h"
+
 LV_FONT_DECLARE(font_awesome_20_4); /* 顶栏链路图标 */
 
 static const char *TAG = "ui_tank";
@@ -147,13 +151,13 @@ static void create_card(lv_obj_t *content, int idx)
     lv_obj_t *name = lv_label_create(card);
     lv_label_set_text(name, d->name);
     lv_obj_set_style_text_color(name, lv_color_hex(TH_LABEL), 0);
-    lv_obj_set_style_text_font(name, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_font(name, font_service_small(), 0);
     lv_obj_align(name, LV_ALIGN_TOP_LEFT, 14, 6);
 
     s_val[idx] = lv_label_create(card);
     lv_label_set_text(s_val[idx], "--");
     lv_obj_set_style_text_color(s_val[idx], lv_color_hex(d->color), 0);
-    lv_obj_set_style_text_font(s_val[idx], &font_puhui_20_4, 0);
+    lv_obj_set_style_text_font(s_val[idx], font_service_large(), 0);
     lv_obj_align(s_val[idx], LV_ALIGN_TOP_LEFT, 14, 32);
 }
 

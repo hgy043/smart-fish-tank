@@ -28,6 +28,23 @@
 # ⚠️ 但那个数字**不是本工程实测的** —— 本工程从未构建过 esp-sr。
 #    真要启用时以实际打包出来的 srmodels.bin 为准。
 #    若届时用更大的模型集（如 MultiNet 自定义命令词），需重新排布分区。
+#   - fonts 分区（2026-10-14 新增）：装 `fonts/font_noto_qwen_16_4.bin`
+#     （1,961,896 B = 1.87 MiB，2MB 够）。用途见 fonts/README.md ——
+#     普惠体是子集化字体（CJK 只有 5258 个），AI 回复里偶尔会出现字集外的
+#     汉字，屏幕就画一个占位方框。这个 Noto 版覆盖 CJK 10335 个，作为 fallback。
+#     **放在两个 OTA 槽之后，不挪动任何已有分区的偏移。**
+#     刷写由顶层 CMakeLists.txt 的 esptool_py_flash_to_partition() 挂在
+#     `idf.py flash` 上，不需要手工 esptool 命令。
+#     剩余空隙 0xD00000 之后还有 1MB（本分区 2MB，尾部留 1MB 不用）。
+#
+# 尺寸校验（全部 4KB 对齐、首尾相接、无重叠）：
+#   nvs      0x009000 .. 0x019000   (0x10000,  64KB)
+#   otadata  0x019000 .. 0x01B000   (0x2000,    8KB)
+#   phy_init 0x01B000 .. 0x01C000   (0x1000,    4KB)
+#   model    0x01C000 .. 0x100000   (0xE4000, 912KB)  <- 填满 phy_init 与 ota_0 之间
+#   ota_0    0x100000 .. 0x700000   (6MB)
+#   ota_1    0x700000 .. 0xD00000   (6MB)
+#   fonts    0xD00000 .. 0xF00000   (2MB)   <- 16MB flash 的尾部空隙
 # ============================================================================
 # Name,     Type, SubType, Offset,    Size,     Flags
 nvs,        data, nvs,     0x9000,    0x10000,
@@ -36,3 +53,4 @@ phy_init,   data, phy,     0x1B000,   0x1000,
 model,      data, spiffs,  0x1C000,   0xE4000,
 ota_0,      app,  ota_0,   0x100000,  6M,
 ota_1,      app,  ota_1,   0x700000,  6M,
+fonts,      data, spiffs,  0xD00000,  2M,

@@ -33,6 +33,7 @@
 #include "lcd_display.h"
 #include "audio_service.h"
 #include "ui_lvgl.h"
+#include "font_service.h"   /* 中文字体：普惠体 + Noto 回退（见该头文件顶部） */
 #include "camera_service.h"
 #include "sd_service.h"
 #include "ui_lvgl_config.h"     /* 只为断言缩略图参数与 sd_service 一致 */
@@ -1445,6 +1446,14 @@ static void ui_task(void *arg)
      * 那一屏自查一次性覆盖「LVGL 渲染 → 标准 RGB565 直通 → SPI → DMA 完成」
      * 整条新路径，且把判据压进**同一张照片**，不依赖人工记忆顺序。
      * ====================================================================== */
+
+    /* ---- 中文字体服务（必须在建任何文字控件之前）----
+     * 把 flash 的 `fonts` 分区里那个覆盖面更大的 Noto 字体挂成普惠体的 fallback，
+     * 解决 AI 回复里偶尔出现的生僻字画成方框的问题（详见 font_service.h）。
+     * **不致命**：分区缺失/内容不对时它只打一条 WARN，界面照常。 */
+    (void)font_service_init();
+    ESP_LOGI(TAG, "[字体] %s", font_service_status());
+
     const esp_err_t iret = ui_lvgl_init();
     if (iret != ESP_OK) {
         /* 刻意**不**删除本任务：monitor_task 持有它的句柄，对已删除任务的

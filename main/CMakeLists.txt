@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS        "app_main.c"
     INCLUDE_DIRS "."
-    REQUIRES     app_core board_gec net_service lcd_display audio_service ui_lvgl camera_service sd_service xiaozhi_client opus_codec nvs_flash esp_timer esp_driver_gpio
+    REQUIRES     app_core board_gec net_service lcd_display audio_service ui_lvgl font_service camera_service sd_service xiaozhi_client opus_codec nvs_flash esp_timer esp_driver_gpio
 )
 
 # ============================================================================

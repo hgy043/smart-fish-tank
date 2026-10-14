@@ -25,8 +25,9 @@
 
 #include "font_awesome.h"
 
-LV_FONT_DECLARE(font_puhui_20_4);
-LV_FONT_DECLARE(font_puhui_16_4);
+/* 中文字体走 font_service（普惠体 + Noto 回退）—— 理由见 font_service.h 顶部。 */
+#include "font_service.h"
+
 LV_FONT_DECLARE(font_awesome_20_4);
 
 static const char *TAG = "ui_pages";
@@ -93,7 +94,7 @@ lv_obj_t *ui_page_make_shell(lv_obj_t *parent, const char *title, bool with_back
     lv_obj_t *t = lv_label_create(parent);
     lv_label_set_text(t, title);
     lv_obj_set_style_text_color(t, lv_color_hex(TH_TITLE), 0);
-    lv_obj_set_style_text_font(t, &font_puhui_20_4, 0);
+    lv_obj_set_style_text_font(t, font_service_large(), 0);
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 12);
 
     /* 顶栏下的分隔线 */
@@ -171,13 +172,13 @@ static void build_menu_page(lv_obj_t *root)
 
         lv_obj_t *title = lv_label_create(btn);
         lv_label_set_text(title, it->title);
-        lv_obj_set_style_text_font(title, &font_puhui_20_4, 0);
+        lv_obj_set_style_text_font(title, font_service_large(), 0);
         lv_obj_set_style_text_color(title, lv_color_hex(TH_TEXT), 0);
         lv_obj_align(title, LV_ALIGN_LEFT_MID, 58, -10);
 
         lv_obj_t *desc = lv_label_create(btn);
         lv_label_set_text(desc, it->desc);
-        lv_obj_set_style_text_font(desc, &font_puhui_16_4, 0);
+        lv_obj_set_style_text_font(desc, font_service_small(), 0);
         lv_obj_set_style_text_color(desc, lv_color_hex(TH_LABEL), 0);
         lv_obj_align(desc, LV_ALIGN_LEFT_MID, 58, 12);
 
@@ -452,7 +453,7 @@ void ui_pages_chat_add(ui_chat_role_t role, const char *text)
 
     lv_obj_t *label = lv_label_create(bubble);
     lv_label_set_text(label, text);
-    lv_obj_set_style_text_font(label, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_font(label, font_service_small(), 0);
     lv_obj_set_style_text_line_space(label, 6, 0);
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
 
@@ -460,7 +461,7 @@ void ui_pages_chat_add(ui_chat_role_t role, const char *text)
        ⚠️ 气泡宽要**留出内边距**（+2×pad）—— xiaozhi 那边把气泡设成与文字同宽，
        而气泡有 8px padding，文字实际比可用区宽 16px，会被挤着换行。
        这里补上这 16px，是本实现对参考的唯一修正。 */
-    lv_coord_t w = chat_text_width(text, &font_puhui_16_4);
+    lv_coord_t w = chat_text_width(text, font_service_small());
     if (w < 20)            { w = 20; }
     if (w > TH_CHAT_MAX_W) { w = TH_CHAT_MAX_W; }
     lv_obj_set_width(label, w);
@@ -669,7 +670,7 @@ static void build_ai_page(lv_obj_t *root)
        文字随状态变，见 ui_pages_set_talk_state()。 */
     s_mic_btn_lbl = lv_label_create(bar);
     lv_label_set_text(s_mic_btn_lbl, "语音（未连接）");
-    lv_obj_set_style_text_font(s_mic_btn_lbl, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_font(s_mic_btn_lbl, font_service_small(), 0);
     lv_obj_set_style_text_color(s_mic_btn_lbl, lv_color_hex(TH_TEXT), 0);
 }
 
@@ -746,7 +747,7 @@ static void build_album_page(lv_obj_t *root)
 
     s_album_note = lv_label_create(content);
     lv_label_set_text(s_album_note, "进入本页后读取 TF 卡…");
-    lv_obj_set_style_text_font(s_album_note, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_font(s_album_note, font_service_small(), 0);
     lv_obj_set_style_text_color(s_album_note, lv_color_hex(TH_LABEL), 0);
     lv_obj_align(s_album_note, LV_ALIGN_BOTTOM_LEFT, m, -8);
 }

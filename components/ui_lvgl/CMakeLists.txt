@@ -16,7 +16,9 @@
 #   lvgl                LVGL 本体
 #   esp_lvgl_port       渲染任务 / 锁 / tick
 #   lcd_display         绘制接口 + 完成钩子
-#   78__xiaozhi-fonts   中文字体 font_puhui_20_4
+#   78__xiaozhi-fonts   Font Awesome 图标字体（顶栏链路图标 + 麦克风键）
+#   font_service        中文字体（普惠体 + Noto 回退）—— **中文字一律用它**，
+#                       **不要直接引用 font_puhui_* 那个 const 符号**
 #   以上除 app_core 外都只在 .c 内出现，故放 PRIV_REQUIRES，
 #   避免把 lvgl.h 之类的重头文件泄漏给 main。
 #
@@ -28,7 +30,7 @@ idf_component_register(
     SRCS        "ui_lvgl.c" "ui_pages.c" "ui_dashboard.c"
     INCLUDE_DIRS "include"
     REQUIRES     app_core
-    PRIV_REQUIRES lvgl esp_lvgl_port lcd_display touch_input 78__xiaozhi-fonts
+    PRIV_REQUIRES lvgl esp_lvgl_port lcd_display touch_input 78__xiaozhi-fonts font_service
 )
 
 # ============================================================================

@@ -40,11 +40,10 @@
 #include "ui_pages.h"
 #include "ui_lvgl_config.h"
 
-/* 中文字体（来自 78/xiaozhi-fonts 组件）。
- * LVGL 字体就是一个 const lv_font_t 全局符号，用这个宏在使用处声明即可 ——
- * 该组件的 include/font_puhui.h 是**空文件**，这不是它的疏忽，而是既定用法：
- * 字体以符号形式导出，由使用方按需声明（xiaozhi 也是这样用的）。 */
-LV_FONT_DECLARE(font_puhui_20_4);
+/* 中文字体走 font_service（普惠体 + Noto 回退）。
+ * ⚠️ 不再直接 LV_FONT_DECLARE(font_puhui_20_4) —— 那个是 **const**，
+ *    没地方挂 fallback；理由见 font_service.h 顶部。 */
+#include "font_service.h"
 
 static const char *TAG = "ui_lvgl";
 
@@ -227,7 +226,7 @@ static void ui_lvgl_color_selftest(void)
         lv_obj_set_style_bg_color(cell, c, 0);
 
         lv_obj_t *lab = lv_label_create(cell);
-        lv_obj_set_style_text_font(lab, &font_puhui_20_4, 0);
+        lv_obj_set_style_text_font(lab, font_service_large(), 0);
         lv_obj_set_style_text_align(lab, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(lab,
             k_cards[i].black_label ? lv_color_black() : lv_color_white(), 0);
@@ -236,7 +235,7 @@ static void ui_lvgl_color_selftest(void)
     }
 
     lv_obj_t *title = lv_label_create(scr);
-    lv_obj_set_style_text_font(title, &font_puhui_20_4, 0);
+    lv_obj_set_style_text_font(title, font_service_large(), 0);
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_label_set_text(title, "色卡：每格应等于格内文字所述颜色");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
