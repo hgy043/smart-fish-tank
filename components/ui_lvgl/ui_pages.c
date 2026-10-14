@@ -194,7 +194,15 @@ static void build_menu_page(lv_obj_t *root)
  *
  * 【布局】内容区 480 × (320 - 44) = 480 × 276
  *     聊天区   480 × 224   可垂直滚动，气泡自上而下堆叠
- *     操作栏   480 ×  52   底部：[拍照] [语音·占位]
+ *     操作栏   480 ×  52   底部：居中一个**圆形语音键**（麦克风图标 + 状态文字）
+ *
+ * 【为什么只剩一个按钮】
+ *   原本还有一个「拍照」矩形键（P6-a）。2026-10-14 用户要求去掉 —— 拍照现在
+ *   由 AI 侧驱动（`self.camera.take_photo` MCP 工具，见 xiaozhi_mcp.c），
+ *   而且**拍到的照片照样会作为聊天气泡出现在本页**（ui_lvgl_show_photo），
+ *   所以手动按钮是重复入口。随之把 `ui_pages_take_capture_request()` /
+ *   `ui_pages_set_camera_ready()` 一并删掉 —— 按钮没了，那条请求链
+ *   就再也不会被触发，留着就是永远不会执行的代码。
  *
  * 【气泡三态】搬自 xiaozhi `main/display/lcd_display.cc` 的 WeChat 分支：
  *     用户   右对齐，微信绿 0x95EC69
@@ -212,16 +220,15 @@ static void build_menu_page(lv_obj_t *root)
  *   短消息不该撑满整行（那样看着像公告不像对话），长消息自动换行。
  * ========================================================================== */
 #define AI_CHAT_MAX_MSG   20      /* 最多保留的消息条数（与 xiaozhi MAX_MESSAGES 一致）*/
-#define AI_BTN_H          32
-#define AI_BAR_PAD        10      /* 操作栏内边距 */
-#define AI_BTN_W          ((TH_W - 2 * TH_MARGIN - 12) / 2)
+#define AI_MIC_D          40      /* 圆形语音键直径 */
+#define AI_ICON_W         18      /* 麦克风图标的画布尺寸 */
+#define AI_ICON_H         22
 
-static lv_obj_t *s_chat_list  = NULL;   /* 聊天区（flex column，可滚动）*/
-static lv_obj_t *s_chat_photo = NULL;   /* 当前那张照片的 lv_image；同刻只留一张 */
-static lv_obj_t *s_cam_btn    = NULL;
-static lv_obj_t *s_cam_btn_lbl = NULL;
-static lv_obj_t *s_mic_btn    = NULL;
-static lv_obj_t *s_mic_btn_lbl = NULL;
+static lv_obj_t *s_chat_list   = NULL;  /* 聊天区（flex column，可滚动）*/
+static lv_obj_t *s_chat_photo  = NULL;  /* 当前那张照片的 lv_image；同刻只留一张 */
+static lv_obj_t *s_mic_btn     = NULL;  /* 圆形语音键 */
+static lv_obj_t *s_mic_icon    = NULL;  /* 键里的麦克风图标（整体调透明度用）*/
+static lv_obj_t *s_mic_btn_lbl = NULL;  /* 圆钮右侧的状态文字 */
 
 /* 麦克风按钮是否**正被按住**（P7 按键说话）。
  *
@@ -230,32 +237,8 @@ static lv_obj_t *s_mic_btn_lbl = NULL;
  * 按下-松开。请求式的标志会漏事件；而"当前是否按住"是**状态**，
  * 只要轮询还存在就一定读得到正确值（最多晚 60ms）。
  *
- * ⚠️ 与 s_capture_req 同一条纪律：只在 LVGL 回调里**写**，
- *    只在锁外**读**。读侧不碰 LVGL。 */
+ * ⚠️ 只在 LVGL 回调里**写**，只在锁外**读**。读侧不碰 LVGL。 */
 static volatile bool s_talk_held = false;
-
-/* 拍照请求标志。
- * ⚠️ 只允许**置位**（在 LVGL 回调里）与**取走**（在 ui_task 锁外轮询），
- *    任何一侧都不做别的事 —— 耗时动作一律留在锁外。 */
-static volatile bool s_capture_req = false;
-
-static void on_capture_clicked(lv_event_t *e)
-{
-    (void)e;
-    /* 这里跑在 taskLVGL 上下文、**且已持 LVGL 锁**。
-       所以只能置个标志就返回 —— 一旦在这里调 camera_service_capture()，
-       最长 4 秒的阻塞会把整个界面（含触摸）冻住。 */
-    s_capture_req = true;
-}
-
-bool ui_pages_take_capture_request(void)
-{
-    if (!s_capture_req) {
-        return false;
-    }
-    s_capture_req = false;
-    return true;
-}
 
 /* --------------------------------------------------------------------------
  * 语音按钮（按键说话）
@@ -287,7 +270,7 @@ void ui_pages_set_talk_ready(bool ready)
     if (s_mic_btn == NULL) {
         return;
     }
-    /* 与拍照按钮同一套做法：用 LVGL 的 DISABLED 状态而不是自己记标志 ——
+    /* 用 LVGL 的 DISABLED 状态而不是自己记标志 ——
        处于该状态的对象不会再派发 PRESSED，所以"没连上就按不动"是天然成立的，
        不需要在回调里再判一次。 */
     if (ready) {
@@ -297,6 +280,13 @@ void ui_pages_set_talk_ready(bool ready)
         s_talk_held = false;    /* 变成不可用的瞬间必须清掉，否则会卡在"一直按住" */
     }
     lv_obj_set_style_bg_opa(s_mic_btn, ready ? LV_OPA_COVER : LV_OPA_50, 0);
+
+    /* 图标要跟着一起淡 —— 它是**独立的对象**，不受按钮 bg_opa 影响。
+       只调按钮不调图标的话，会出现"淡色圆底上顶着一个亮白麦克风"的怪样子。
+       用 opa（而非 bg_opa）是因为它会带上孩子一起变。 */
+    if (s_mic_icon != NULL) {
+        lv_obj_set_style_opa(s_mic_icon, ready ? LV_OPA_COVER : LV_OPA_50, 0);
+    }
 
     if (s_mic_btn_lbl != NULL) {
         lv_label_set_text(s_mic_btn_lbl, ready ? "按住说话" : "语音（未连接）");
@@ -563,24 +553,56 @@ void ui_pages_chat_add_photo(const lv_image_dsc_t *dsc)
     chat_scroll_to_bottom();
 }
 
-void ui_pages_set_camera_ready(bool ready)
-{
-    if (s_cam_btn == NULL) {
-        return;
-    }
-    /* 置灰但仍可见 —— 比直接隐藏更能说明"功能存在但不可用"。
-       用 LVGL 的 DISABLED 状态而不是自己记标志：处于该状态的对象
-       **不会**再派发 CLICKED，所以连点/拍摄中再点都不会进回调。 */
-    if (ready) {
-        lv_obj_remove_state(s_cam_btn, LV_STATE_DISABLED);
-    } else {
-        lv_obj_add_state(s_cam_btn, LV_STATE_DISABLED);
-    }
-    lv_obj_set_style_bg_opa(s_cam_btn, ready ? LV_OPA_COVER : LV_OPA_50, 0);
+/* --------------------------------------------------------------------------
+ * 麦克风图标
+ *
+ * 【为什么是画出来的，不是字符】
+ *   · LVGL 内置符号里**没有麦克风**。最接近的 `LV_SYMBOL_AUDIO` 是
+ *     "带声波的喇叭"（Font Awesome 0xF001），语义是音量不是录音。
+ *   · 而且本工程标签用的是普惠体（`font_puhui_*`），**不含** Font Awesome
+ *     那段私用区码位 —— 硬塞 LV_SYMBOL_AUDIO 只会画出一个缺字方块。
+ *   故用图元拼：胶囊机身 + 竖杆 + 基座横线，是最经典的麦克风造型，
+ *   且完全不依赖字体。
+ * -------------------------------------------------------------------------- */
 
-    if (s_cam_btn_lbl != NULL) {
-        lv_label_set_text(s_cam_btn_lbl, ready ? "拍照" : "摄像头不可用");
-    }
+/**
+ * @brief 画一个实心圆角矩形，当图标的零件。
+ *
+ * ⚠️ **必须去掉 CLICKABLE**：`lv_obj` 默认可点击，零件会把手势从按钮上吃掉 ——
+ *    现象是"图标画得挺好看，但按住没反应"。因为视觉完全正常，
+ *    这种问题很难往"零件把事件挡了"上想，所以在这里写死。
+ */
+static lv_obj_t *icon_part(lv_obj_t *parent, int x, int y, int w, int h,
+                           int radius)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);   /* ★ 见函数头 */
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_size(o, w, h);
+    lv_obj_set_style_bg_color(o, lv_color_hex(TH_CARD), 0);   /* 白色图标 */
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(o, radius, 0);
+    return o;
+}
+
+/** 在圆钮里居中地画一个麦克风。坐标相对 18 × 22 的画布。 */
+static void build_mic_icon(lv_obj_t *btn)
+{
+    s_mic_icon = lv_obj_create(btn);
+    lv_obj_remove_style_all(s_mic_icon);
+    lv_obj_remove_flag(s_mic_icon, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_mic_icon, LV_OBJ_FLAG_CLICKABLE);   /* 同上 */
+    lv_obj_set_size(s_mic_icon, AI_ICON_W, AI_ICON_H);
+    lv_obj_center(s_mic_icon);
+
+    /* ① 机身：竖胶囊（半径取宽度的一半，两端正好是半圆）*/
+    icon_part(s_mic_icon, 4, 0, 10, 15, 5);
+    /* ② 竖杆：从机身底连到基座 */
+    icon_part(s_mic_icon, 8, 15, 2, 5, 1);
+    /* ③ 基座横线 */
+    icon_part(s_mic_icon, 1, 20, 16, 2, 1);
 }
 
 /* --------------------------------------------------------------------------
@@ -605,7 +627,10 @@ static void build_ai_page(lv_obj_t *root)
     lv_obj_set_flex_align(s_chat_list, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    /* ---- 底部操作栏 ---- */
+    /* ---- 底部操作栏 ----
+       本页其它地方一律绝对定位，这里改用 flex：要让「圆钮 + 状态文字」
+       整体居中，而文字的宽度随状态变（"按住说话"/"识别中…"…），
+       绝对定位算不出这个宽度。 */
     lv_obj_t *bar = lv_obj_create(content);
     lv_obj_remove_style_all(bar);
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
@@ -613,47 +638,38 @@ static void build_ai_page(lv_obj_t *root)
     lv_obj_set_size(bar, TH_W, TH_CHAT_BAR_H);
     lv_obj_set_style_bg_color(bar, lv_color_hex(TH_CARD), 0);
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_column(bar, 14, 0);     /* 圆钮与文字之间的间距 */
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    /* 拍照（左） */
-    s_cam_btn = lv_obj_create(bar);
-    lv_obj_remove_style_all(s_cam_btn);
-    lv_obj_remove_flag(s_cam_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_cam_btn, TH_MARGIN, AI_BAR_PAD);
-    lv_obj_set_size(s_cam_btn, AI_BTN_W, AI_BTN_H);
-    lv_obj_set_style_bg_color(s_cam_btn, lv_color_hex(TH_ACCENT), 0);
-    lv_obj_set_style_bg_opa(s_cam_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_cam_btn, 8, 0);
-    lv_obj_add_event_cb(s_cam_btn, on_capture_clicked, LV_EVENT_CLICKED, NULL);
-
-    s_cam_btn_lbl = lv_label_create(s_cam_btn);
-    lv_label_set_text(s_cam_btn_lbl, "拍照");
-    lv_obj_set_style_text_font(s_cam_btn_lbl, &font_puhui_16_4, 0);
-    lv_obj_set_style_text_color(s_cam_btn_lbl, lv_color_hex(TH_CARD), 0);
-    lv_obj_center(s_cam_btn_lbl);
-
-    /* 语音（右）—— P7 按键说话。
+    /* ---- 圆形语音键（唯一的一个按钮）----
        按住 = 开始录并上行；松开 = 停止上行，等服务器回复。
        选"按住说话"而不是"点一下开始、再点一下结束"，是因为前者
        松手即停，用户不需要记住"现在是不是在录"这个状态。 */
     s_mic_btn = lv_obj_create(bar);
     lv_obj_remove_style_all(s_mic_btn);
     lv_obj_remove_flag(s_mic_btn, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_mic_btn, TH_MARGIN + AI_BTN_W + 12, AI_BAR_PAD);
-    lv_obj_set_size(s_mic_btn, AI_BTN_W, AI_BTN_H);
+    lv_obj_set_size(s_mic_btn, AI_MIC_D, AI_MIC_D);
+    lv_obj_set_style_radius(s_mic_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_mic_btn, lv_color_hex(TH_ACCENT), 0);
     lv_obj_set_style_bg_opa(s_mic_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_mic_btn, 8, 0);
     /* 初始不可用，等 xz_client 连上服务器后由 ui_lvgl_set_talk_ready(true) 打开 */
     lv_obj_add_state(s_mic_btn, LV_STATE_DISABLED);
     lv_obj_add_event_cb(s_mic_btn, on_mic_pressed,   LV_EVENT_PRESSED,    NULL);
     lv_obj_add_event_cb(s_mic_btn, on_mic_released,  LV_EVENT_RELEASED,   NULL);
     lv_obj_add_event_cb(s_mic_btn, on_mic_released,  LV_EVENT_PRESS_LOST, NULL);
 
-    s_mic_btn_lbl = lv_label_create(s_mic_btn);
+    build_mic_icon(s_mic_btn);
+
+    /* ---- 状态文字 ----
+       **不是按钮**，只是提示。保留它是因为圆钮上只有一个图标，而
+       "按住"这个动作光看麦克风图标猜不出来（图标通常意味着"点一下"）。
+       文字随状态变，见 ui_pages_set_talk_state()。 */
+    s_mic_btn_lbl = lv_label_create(bar);
     lv_label_set_text(s_mic_btn_lbl, "语音（未连接）");
     lv_obj_set_style_text_font(s_mic_btn_lbl, &font_puhui_16_4, 0);
-    lv_obj_set_style_text_color(s_mic_btn_lbl, lv_color_hex(TH_CARD), 0);
-    lv_obj_center(s_mic_btn_lbl);
+    lv_obj_set_style_text_color(s_mic_btn_lbl, lv_color_hex(TH_TEXT), 0);
 }
 
 /* ==========================================================================

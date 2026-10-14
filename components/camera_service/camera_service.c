@@ -12,9 +12,12 @@
  *     （取 2 帧求稳 + `__builtin_bswap16`）
  * 有意偏离之处：
  *   · 分辨率 VGA → **QVGA**（理由见 camera_service.h）
- *   · 去掉 xiaozhi 的 `Explain()`（上传给它的云服务做 AI 看图）—— 本项目没有
- *     那个服务；本轮需求是「拍照并当场显示」，不含上传
  *   · 去掉 C++ 包装类，改为纯 C（本工程其余组件都是 C）
+ *   · xiaozhi 的 `Explain()` 拆成两半：**拍照+JPEG 编码留在这里**
+ *     （`camera_service_capture_jpeg()`），**上传给云服务的那半挪到了
+ *     `xiaozhi_client`**（它才拿着服务器给的 vision 地址）。
+ *     拆的理由：`esp_camera.h` / `img_converters.h` 只在本组件内可见，
+ *     别处编不了码；而 vision 地址是协议层的东西，本组件不该知道。
  *
  * ⚠️ xiaozhi 的 ESP-IDF 就是 **v5.5.3**（与其 build/project_description.json 一致），
  *    与本工程同版本 —— 这套驱动 API 组合在同版本上跑通过，不是纸面推断。
@@ -29,11 +32,13 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 
-#include "esp_camera.h"     /* 托管组件 espressif/esp32-camera */
+#include "esp_camera.h"         /* 托管组件 espressif/esp32-camera */
+#include "img_converters.h"     /* frame2jpg_cb —— JPEG 编码 */
 #include "gec_board.h"
 
 static const char *TAG = "camera";
@@ -41,9 +46,10 @@ static const char *TAG = "camera";
 /* ==========================================================================
  * 内部状态
  * ========================================================================== */
-static bool      s_inited = false;
-static bool      s_ready  = false;      /* init 成功且缓冲已分配 */
-static uint16_t *s_frame  = NULL;       /* 本组件自有的输出缓冲 */
+static bool             s_inited = false;
+static bool             s_ready  = false;   /* init 成功且缓冲已分配 */
+static uint16_t        *s_frame  = NULL;    /* 本组件自有的输出缓冲 */
+static SemaphoreHandle_t s_lock  = NULL;    /* 串行化整个抓帧过程，见下 */
 
 /* 未就绪原因描述。用静态缓冲是因为它要交给界面显示，不能是栈上的临时量。
    只在 init / capture 失败时写入，不需要保护。 */
@@ -108,7 +114,19 @@ esp_err_t camera_service_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* ---- 1. 摄像头电源：PCA9557 P2，**低有效**，置 0 上电 ----
+    /* ---- 1. 互斥锁 ----
+       原先只有一个调用者（ui_task 的手动拍照），所以整个组件没有锁。
+       现在多了 AI 拍照这条路（跑在 xiaozhi 的工具任务上），两个任务会同时
+       碰**同一个** `fb_count=1` 的驱动帧缓冲和同一块 s_frame —— 必须串行化。 */
+    s_lock = xSemaphoreCreateMutex();
+    if (s_lock == NULL) {
+        set_status("内部锁创建失败");
+        ESP_LOGE(TAG, "%s", s_status);
+        s_inited = true;
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* ---- 2. 摄像头电源：PCA9557 P2，**低有效**，置 0 上电 ----
        上电前 xiaozhi 的做法也是先 SetOutputState(2, 0)，
        它的 PCA9557 初值里 P2=1（断电），所以这一步是必需的。 */
     const esp_err_t pret = gec_pca9557_set_output(GEC_PCA9557_IO_DVP_PWDN,
@@ -123,7 +141,7 @@ esp_err_t camera_service_init(void)
              (int)GEC_PCA9557_LEVEL_DVP_POWER_ON);
     vTaskDelay(pdMS_TO_TICKS(CAMERA_SERVICE_POWER_SETTLE_MS));
 
-    /* ---- 2. 驱动配置 ----
+    /* ---- 3. 驱动配置 ----
        引脚**全部**取自 gec_board.h，不在这里写魔数（pinmap.md 是引脚真源）。 */
     camera_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -181,7 +199,7 @@ esp_err_t camera_service_init(void)
         ESP_LOGW(TAG, "esp_camera_sensor_get() 返回 NULL，无法确认型号");
     }
 
-    /* ---- 3. 镜像/翻转（**无条件下发**，不做"值为 0 就跳过"）----
+    /* ---- 4. 镜像/翻转（**无条件下发**，不做"值为 0 就跳过"）----
        理由：这颗 GC0308 的寄存器默认值不是"不镜像"。
        xiaozhi 对 GC0308 有一句特判 `set_hmirror(s, 0)`，注释写"写1镜像 写0不镜像"
        —— 说明必须显式关掉才能得到不镜像的画面。跳过下发就会继承出厂默认。 */
@@ -192,7 +210,7 @@ esp_err_t camera_service_init(void)
                  CAMERA_SERVICE_HMIRROR, CAMERA_SERVICE_VFLIP);
     }
 
-    /* ---- 4. 输出缓冲 ----
+    /* ---- 5. 输出缓冲 ----
        与驱动帧缓冲独立，理由见头文件：避免「LVGL 正在读、摄像头正在写」。
        放 PSRAM —— 它**不直接做 SPI DMA 源**（交给 LVGL 后会经 panel_send
        从内部 RAM 的条带缓冲发出），故不受 architecture.md 7.4 那条约束。 */
@@ -216,7 +234,48 @@ esp_err_t camera_service_init(void)
 /* ==========================================================================
  * 抓帧
  * ========================================================================== */
-esp_err_t camera_service_capture(void)
+
+/* ---- JPEG 输出缓冲 ----
+   惰性分配（第一次要 JPEG 时才申请）：不拍照给 AI 的场景下不白占 64KB。
+   放在 PSRAM —— 它是纯粹的字节缓冲，不做 DMA 源。
+
+   **所有权归本组件**，不交给调用方 free：与 camera_service_frame() 一致，
+   指针在下一次 camera_service_capture_jpeg() 之前有效。
+   这样避免"谁分配谁释放"的配对错误，也省掉每次拍照的 malloc/free。 */
+static uint8_t *s_jpg     = NULL;
+static size_t   s_jpg_len = 0;
+static bool     s_jpg_ovf = false;      /* 回调里写溢出 → 整次调用判失败 */
+
+/** frame2jpg_cb 的输出回调。
+ *  ⚠️ 编码器收尾时会调 put_buf(NULL, 0)（to_jpg.cpp:161-165），那是**结束哨兵**，
+ *     不是数据 —— 必须吃掉，否则会当成一次长度 0 的写入。 */
+static size_t jpg_write_cb(void *arg, size_t index, const void *data, size_t len)
+{
+    (void)arg;
+    (void)index;
+
+    if (data == NULL || len == 0) {
+        return 0;                       /* 结束哨兵 */
+    }
+    if (s_jpg == NULL || s_jpg_len + len > CAMERA_SERVICE_JPEG_MAX) {
+        /* 不静默截断 —— 置标志，让调用方把整次拍照判失败并记日志。
+           参考实现的缓冲版 frame2jpg() 正是在这里静默丢弃多余数据
+           （to_jpg.cpp:201-204，连警告日志都被注释掉了），
+           结果是"上传成功但图是坏的"，从日志上完全看不出来。 */
+        s_jpg_ovf = true;
+        return 0;
+    }
+    memcpy(s_jpg + s_jpg_len, data, len);
+    s_jpg_len += len;
+    return len;
+}
+
+/**
+ * @brief 抓一帧的内部实现。**调用方必须已持有 s_lock。**
+ *
+ * @param want_jpeg true = 顺带编码成 JPEG 存进 s_jpg/s_jpg_len
+ */
+static esp_err_t capture_locked(bool want_jpeg)
 {
     if (!s_ready || s_frame == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -259,6 +318,47 @@ esp_err_t camera_service_capture(void)
         return ESP_ERR_INVALID_SIZE;
     }
 
+    /* ---- JPEG 编码（先做，失败就早退，省掉下面的字节交换）----
+       ⚠️ 编码的是**驱动给的原始 fb**，不是下面交换过的 s_frame。
+          编码器默认 `rgb565_big_endian = true`（to_jpg.cpp:34），正是驱动输出的
+          字节序 —— 原样喂进去即可。喂 s_frame 才需要 jpgSetRgb565BE(false)，
+          而那是**全局可变状态、非线程安全**（to_jpg.cpp:247-255），能不用就不用。
+       ⚠️ 用 **_cb 流式版**，理由见 jpg_write_cb()。 */
+    if (want_jpeg) {
+        if (s_jpg == NULL) {
+            s_jpg = (uint8_t *)heap_caps_malloc(CAMERA_SERVICE_JPEG_MAX,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (s_jpg == NULL) {
+                set_status("JPEG 缓冲分配失败（需 %u 字节 PSRAM）",
+                           (unsigned)CAMERA_SERVICE_JPEG_MAX);
+                ESP_LOGE(TAG, "%s", s_status);
+                esp_camera_fb_return(fb);
+                return ESP_ERR_NO_MEM;
+            }
+            ESP_LOGI(TAG, "JPEG 输出缓冲就绪：%u 字节（PSRAM）",
+                     (unsigned)CAMERA_SERVICE_JPEG_MAX);
+        }
+        s_jpg_len = 0;
+        s_jpg_ovf = false;
+
+        if (!frame2jpg_cb(fb, CAMERA_SERVICE_JPEG_QUALITY, jpg_write_cb, NULL)
+            || s_jpg_ovf) {
+            if (s_jpg_ovf) {
+                set_status("JPEG 超出缓冲上限 %u 字节",
+                           (unsigned)CAMERA_SERVICE_JPEG_MAX);
+            } else {
+                set_status("JPEG 编码失败");
+            }
+            ESP_LOGE(TAG, "%s（已写 %u 字节）", s_status, (unsigned)s_jpg_len);
+            /* 溢出时已写进去的半截图不能留在缓冲里冒充成品 */
+            s_jpg_len = 0;
+            esp_camera_fb_return(fb);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "JPEG 编码完成：%u 字节（原始 %u 字节）",
+                 (unsigned)s_jpg_len, (unsigned)fb->len);
+    }
+
     /* ---- 字节交换（链条上的第 ① 次）----
      * 驱动交出的 RGB565 是**大端**（高字节在前）：
      *   · cam_hal.c 初始化时 `cam_obj->swap_data = 0`
@@ -276,6 +376,55 @@ esp_err_t camera_service_capture(void)
 
     s_ready = true;
     set_status("就绪 (%dx%d)", CAMERA_SERVICE_H_RES, CAMERA_SERVICE_V_RES);
+    return ESP_OK;
+}
+
+/** 取锁。**带超时，不是 portMAX_DELAY** —— 理由见头文件的线程约束。 */
+static esp_err_t lock_camera(void)
+{
+    if (s_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(CAMERA_SERVICE_LOCK_TIMEOUT_MS))
+        != pdTRUE) {
+        set_status("摄像头忙（另有拍摄在进行）");
+        ESP_LOGW(TAG, "%s —— 本次请求放弃", s_status);
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+esp_err_t camera_service_capture(void)
+{
+    const esp_err_t lret = lock_camera();
+    if (lret != ESP_OK) {
+        return lret;
+    }
+    const esp_err_t ret = capture_locked(false);
+    xSemaphoreGive(s_lock);
+    return ret;
+}
+
+esp_err_t camera_service_capture_jpeg(uint8_t **out, size_t *out_len)
+{
+    if (out == NULL || out_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out     = NULL;
+    *out_len = 0;
+
+    const esp_err_t lret = lock_camera();
+    if (lret != ESP_OK) {
+        return lret;
+    }
+    const esp_err_t ret = capture_locked(true);
+    xSemaphoreGive(s_lock);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    *out     = s_jpg;
+    *out_len = s_jpg_len;
     return ESP_OK;
 }
 

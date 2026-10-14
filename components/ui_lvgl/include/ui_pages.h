@@ -7,7 +7,7 @@
  *
  *     主菜单 (UI_PAGE_MENU)
  *       ├─ 鱼缸情况 (UI_PAGE_TANK)   —— 六张数据卡片
- *       ├─ 小智AI互动 (UI_PAGE_AI)   —— 拍照 + 照片显示（P6-a 接入真实摄像头）
+ *       ├─ 小智AI互动 (UI_PAGE_AI)   —— 聊天流 + 圆形语音键（P7 接入小智）
  *       └─ SD卡相册 (UI_PAGE_ALBUM)  —— 九宫格缩略图（假数据，待 TF 卡引脚确认）
  *
  * 【实现方式：预建 + 显隐切换】
@@ -18,7 +18,8 @@
  *
  * 【线程约定】
  * 本模块所有函数都在 **LVGL 锁内**调用 —— 由 ui_lvgl 负责加解锁。
- * **唯一的例外是 `ui_pages_take_capture_request()`**，见其说明。
+ * **唯一的例外是 `ui_pages_talk_held()`**：给工作任务在**锁外**轮询用，
+ * 它只读一个 volatile 标志，不碰任何 LVGL 对象。
  * ============================================================================
  */
 #pragma once
@@ -88,20 +89,6 @@ lv_obj_t *ui_page_make_shell(lv_obj_t *parent, const char *title, bool with_back
  * ========================================================================== */
 
 /**
- * @brief 【**不加锁**】取走拍照请求。返回 true 表示用户按了拍照键。
- *
- * @note  本函数是**唯一**可以不用持 LVGL 锁的本模块函数，因为它是给
- *        `ui_task` 在**锁外**轮询用的 —— 拍照动作用户按下后必须离开锁外执行
- *        （`camera_service_capture()` 最长阻塞 4 秒，持锁会把 taskLVGL 卡死）。
- *
- *        「按了键」这个动作本身发生在 **taskLVGL 上下文且已持 LVGL 锁**，
- *        回调里**只置一个 volatile 标志**，不做任何耗时操作。
- *
- * @note  读取即清零（取走语义），避免同一请求被处理两次。
- */
-bool ui_pages_take_capture_request(void);
-
-/**
  * @brief 往聊天流里追加一条文字消息。**调用者须已持 LVGL 锁。**
  * @note  内部会拷贝文本，不持有调用方的指针。
  */
@@ -124,12 +111,6 @@ void ui_pages_chat_add(ui_chat_role_t role, const char *text);
  */
 void ui_pages_chat_add_photo(const lv_image_dsc_t *dsc);
 
-/**
- * @brief 设置拍照按钮的可用性。**调用者须已持 LVGL 锁。**
- * @param ready false = 置灰且点击无效。
- */
-void ui_pages_set_camera_ready(bool ready);
-
 /* ==========================================================================
  * 语音按钮（P7 按键说话）
  * ========================================================================== */
@@ -137,8 +118,9 @@ void ui_pages_set_camera_ready(bool ready);
 /**
  * @brief 【**不加锁**】麦克风按钮当前是否**正被按住**。
  *
- * @note 与 `ui_pages_take_capture_request()` 同一条纪律：给**锁外**轮询用。
- *       区别在于它返回的是**状态**而非**一次性请求** ——
+ * @note 这条纪律见文件头的「锁外轮询」说明：给 `ui_task` / `voice_task` 在
+ *       **锁外**读，读侧一律不碰 LVGL。
+ *       关键在于它返回的是**状态**而非**一次性请求** ——
  *       语音任务取帧一次要阻塞 60ms，请求式的标志会漏掉按下-松开这个事件；
  *       状态式的不会。
  *

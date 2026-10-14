@@ -52,6 +52,11 @@
 #include <stddef.h>
 #include "esp_err.h"
 
+/* tank_ecosystem_t —— MCP 工具的数据源用的就是它。
+   本组件因此依赖 app_core（纯数据模型组件，无外部依赖），
+   与 ui_lvgl 依赖 app_core 是同一条既有分层。 */
+#include "app_types.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -106,6 +111,65 @@ const char *xz_activation_code(void);
 
 /** @brief 注册回调。必须在 xz_client_start() 之前调用才保证不漏事件。 */
 void xz_set_callbacks(const xz_callbacks_t *cbs);
+
+/* ==========================================================================
+ * MCP 工具（让 AI 能读鱼缸，P7 阶段 4）
+ *
+ * 连上服务器后，服务器会发来 JSON-RPC 的 `initialize` / `tools/list`，
+ * 之后 LLM 就能在对话中调用我们注册的工具 —— 比如用户问「鱼缸现在怎么样」。
+ * 工具的注册表在 xiaozhi_mcp.c，**上层不需要、也无法在本组件之外加工具**。
+ * ========================================================================== */
+
+/**
+ * @brief MCP 工具读鱼缸状态的数据源。由 main 注册。
+ *
+ * 【为什么用回调，而不是本组件自己去取数据】
+ * 状态快照 `tank_ecosystem_t` 由 main 持有（它才是**唯一的写者**），本组件
+ * 不该反向依赖 main。这与 xiaozhi 的做法是同构的 —— 它的 MCP 工具也是回调进
+ * `board.GetDeviceStatusJson()`（mcp_server.cc:117-119），而不是自己翻数据。
+ *
+ * @param[out] out 写入当前快照
+ * @return true 表示 out 已填好；false 表示数据还没准备好
+ *         （工具会照实回一条 `{"success": false, ...}`，而不是编一个数）。
+ *
+ * ⚠️ **在 esp_websocket_client 自己的任务上被调用**（栈不归我们管）。
+ *    实现必须快、且不能阻塞 —— 典型做法是「加锁 + 结构体拷贝」。
+ */
+typedef bool (*xz_tank_status_fn)(tank_ecosystem_t *out);
+
+/**
+ * @brief 注册鱼缸状态数据源。
+ * @note  必须在 xz_client_start() 之前调用：服务器在 hello 之后**立刻**就会
+ *        发工具请求，注册晚了那一次只能回「取不到数据」。
+ */
+void xz_set_tank_status_provider(xz_tank_status_fn fn);
+
+/**
+ * @brief 拍照数据源（`self.camera.take_photo` 用）。由 main 注册。
+ *
+ * 与上面的鱼缸数据源同一个套路：`camera_service` 是本组件不该依赖的东西，
+ * 所以由 main 把它接起来。
+ *
+ * @param[out] jpeg     JPEG 数据起点
+ * @param[out] out_len  JPEG 字节数
+ * @return ESP_OK；其余为失败（本组件会把它变成一条给 LLM 看的失败说明，
+ *         而不是让这次对话卡住）。
+ *
+ * ⚠️ **在工具任务上被调用，不是在 WebSocket 任务上** —— 这里可以（也应该）
+ *    阻塞：抓帧最长 4 秒、编码若干百毫秒。这是本组件唯一一条允许慢的路径。
+ * @note  返回的缓冲归**实现方**所有，本组件只在本次上传期间读它，不 free、
+ *        也不长期持有。
+ */
+typedef esp_err_t (*xz_camera_capture_fn)(uint8_t **jpeg, size_t *out_len);
+
+/**
+ * @brief 注册拍照数据源。
+ * @note  同样要在 xz_client_start() 之前注册。不注册的话
+ *        `self.camera.take_photo` 会在工具表里**照常出现**（模型能看见），
+ *        但一调就回失败 —— 如果本工程根本不需要这个能力，宁可不注册工具，
+ *        也不要让它变成一个只会说"失败"的工具。
+ */
+void xz_set_camera_capture_provider(xz_camera_capture_fn fn);
 
 /* ==========================================================================
  * 对话控制

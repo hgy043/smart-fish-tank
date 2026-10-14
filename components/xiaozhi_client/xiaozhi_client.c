@@ -261,5 +261,17 @@ esp_err_t xz_client_start(void)
 
     ESP_LOGI(TAG, "已启动。设备 ID=%s，客户端 ID=%s",
              xz_device_id(), xz_client_id());
+
+    /* 慢工具的执行任务（拍照）。与 xz_client 一样是常驻的 ——
+       工具调用的到来是异步的，临时建任务会引入"创建失败"这条额外分支，
+       而它恰恰发生在最需要成功的时刻。 */
+    const esp_err_t wret = xz_mcp_start_worker();
+    if (wret != ESP_OK) {
+        /* 不致命：连接、对话、get_status 都照常，只是拍照工具会回失败。
+           故这里只告警、不回滚 —— 把整个客户端判死代价更大。 */
+        ESP_LOGW(TAG, "工具任务启动失败: %s（拍照工具将不可用）",
+                 esp_err_to_name(wret));
+    }
+
     return ESP_OK;
 }

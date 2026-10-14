@@ -87,6 +87,66 @@ static void eco_snapshot(tank_ecosystem_t *out)
     xSemaphoreGive(s_eco_mutex);
 }
 
+/**
+ * @brief MCP 工具的数据源（注册给 xiaozhi_client，见其头文件里的说明）。
+ *
+ * xz_mcp_handle() 在**小智服务器问「鱼缸现在怎么样」**时调用这里，
+ * 拿到的结构体由 xiaozhi_mcp.c 摊成 JSON 交给 LLM。
+ *
+ * ⚠️ 运行在 **esp_websocket_client 自己的任务**上，那个任务的栈不归我们管。
+ *    这里只做「加锁 + 结构体拷贝」（微秒级），不阻塞 —— 这是它能被这样调用的前提。
+ *    将来若往 MCP 工具里加耗时的东西（比如拍照），**必须先把执行挪到别的任务**，
+ *    否则会堵死 WebSocket 的接收。P7 已经因为在这条任务上解码 Opus 撞过一次
+ *    整机复位（见 s_dl_q 上方那段说明），同一个坑不要踩第二次。
+ *
+ * @return false = 传感器任务还没初始化，没有可信数据。
+ *         **不要**在这种情况下返回 true 并给一个零值快照 —— 那会让 AI 笃定地
+ *         说"水温 0 度"，比说"读不到"糟得多。
+ */
+static bool tank_status_provider(tank_ecosystem_t *out)
+{
+    if (out == NULL || s_eco_mutex == NULL) {
+        return false;
+    }
+    eco_snapshot(out);
+    return true;
+}
+
+/**
+ * @brief MCP 拍照工具的数据源（注册给 xiaozhi_client）。
+ *
+ * 与上面的 tank_status_provider 同一个套路，但**运行上下文完全不同**：
+ * 它在 xiaozhi 的**工具任务**上跑，不是在 WebSocket 任务上。所以这里可以慢 ——
+ * 抓帧最长 4 秒、JPEG 编码若干百毫秒，都允许。这条区别是刻意的：
+ * 慢工具压在那条 WebSocket 任务上会堵死接收（xz_on_audio 上方有血泪说明）。
+ *
+ * @param[out] jpeg    JPEG 数据起点。**归 camera_service 所有，不要 free**，
+ *                     下一次拍照前有效（本函数发完就返回，调用方随即用掉）。
+ * @param[out] out_len JPEG 字节数
+ */
+static esp_err_t camera_capture_provider(uint8_t **jpeg, size_t *out_len)
+{
+    /* ① 拍 + 编码成 JPEG。失败原因已在 camera_service 里记了日志。 */
+    const esp_err_t ret = camera_service_capture_jpeg(jpeg, out_len);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    /* ② 顺带上屏 —— 让用户看得见 **AI 到底看到了什么**。
+       这不是装饰：出问题时它能把两种完全不同的故障当场分开 ——
+       屏幕上的照片糊了 ⇒ 是拍摄问题；照片清楚但 AI 答得不对 ⇒ 是识别/提示问题。
+       少了这一眼，两种故障在日志里长得一模一样。
+
+       ⚠️ 这一步不检查返回值、也不因此判失败：照片已经在上传路上了，
+          上屏失败（取锁超时等）不该把整次工具调用拖垮。 */
+    int w = 0, h = 0;
+    const uint16_t *px = camera_service_frame(&w, &h);
+    if (px != NULL) {
+        (void)ui_lvgl_show_photo(px, w, h);
+    }
+    return ESP_OK;
+}
+
 /** 刷新链路状态字段并更新时间戳 */
 static void eco_refresh_links(void)
 {
@@ -811,58 +871,25 @@ static void sensor_task(void *arg)
 }
 
 /* ==========================================================================
- * 拍照（P6-a/P6-b）
+ * 拍照
  *
- * 【为什么是这个次序 —— 这是唯一一处并发要害】
+ * 【2026-10-14：手动拍照这条路撤了】
+ * 原先这里是 `ui_capture_photo()`，配合界面上的「拍照」键做手动拍摄
+ * （按钮回调置标志 → ui_task 锁外轮询 → 抓帧 → 上屏）。
+ * 用户要求去掉那个键、AI 页只留一个语音键，于是整条链一并删除 ——
+ * 键没了，`ui_lvgl_capture_requested()` 永远不会返回 true，留着就是
+ * 永远不会执行的代码，还会让后来的人误以为"手动拍照还在"。
  *
- *   ① ui_lvgl_chat_add(用户, "拍一张看看")  —— 内部上锁，很快返回
- *   ② ui_lvgl_set_camera_ready(false)       —— 拍摄中禁用按钮，防连点
- *   ③ camera_service_capture()              —— **必须在锁外**，最长阻塞 4 秒
- *   ④ ui_lvgl_show_photo()                  —— 内部上锁，把照片作为一条消息追加
+ * 现在拍照由 **AI 侧**驱动：`self.camera.take_photo` MCP 工具 →
+ * `camera_capture_provider()`（见上）→ 抓帧 + JPEG 编码 + 上传 +
+ * **顺带上屏**。照片照样会作为聊天气泡出现在「小智AI互动」页，
+ * 只是发起方从"用户按按钮"变成了"AI 决定要看"。
  *
- * ③ 若是持着 LVGL 锁做，taskLVGL 会被一起卡住 ——
- * 界面停摆、触摸失灵，而且看起来像"死机"。所以按钮回调只置标志，
- * 真正的抓帧留给这里（ui_task）在锁外执行。
- *
- * ① 用的是异步显示：taskLVGL 独立渲染，所以 ③ 阻塞的这几秒里，
- * 屏幕上能正常显示那条用户消息。
+ * 底层的 `camera_service_capture()`（不带 JPEG 的那条）现在没有调用方了，
+ * 但**保留**：它是 camera_service 这个通用组件的正经入口，
+ * 不只是这条 UI 流程的附属品（调试摄像头、将来加别的触发方式都用得上）。
  * ========================================================================== */
-static void ui_capture_photo(void)
-{
-    /* 在聊天流里体现为"用户说了一句话" —— 这也是 WeChat 风格的用法：
-       拍照是用户发起的一个动作，就该有一条用户消息。 */
-    ui_lvgl_chat_add(UI_CHAT_USER, "拍一张看看");
-    ui_lvgl_set_camera_ready(false);
 
-    const esp_err_t cret = camera_service_capture();
-    if (cret != ESP_OK) {
-        ESP_LOGE(TAG, "拍照失败: %s（%s）", esp_err_to_name(cret),
-                 camera_service_status());
-        ui_lvgl_chat_add(UI_CHAT_SYSTEM, camera_service_status());
-        ui_lvgl_set_camera_ready(true);
-        return;
-    }
-
-    int w = 0, h = 0;
-    const uint16_t *px = camera_service_frame(&w, &h);
-    if (px == NULL) {
-        ESP_LOGE(TAG, "取不到画面帧");
-        ui_lvgl_chat_add(UI_CHAT_SYSTEM, "取不到画面，请重试");
-        ui_lvgl_set_camera_ready(true);
-        return;
-    }
-
-    const esp_err_t sret = ui_lvgl_show_photo(px, w, h);
-    if (sret != ESP_OK) {
-        ESP_LOGE(TAG, "照片上屏失败: %s", esp_err_to_name(sret));
-        ui_lvgl_chat_add(UI_CHAT_SYSTEM, "照片显示失败，请重试");
-        ui_lvgl_set_camera_ready(true);
-        return;
-    }
-
-    ui_lvgl_set_camera_ready(true);
-    ESP_LOGI(TAG, "拍照完成 %dx%d", w, h);
-}
 
 /* ==========================================================================
  * P7 下行语音的播放缓冲
@@ -1301,20 +1328,18 @@ static void ui_task(void *arg)
              (boot_snap.alert_mask != 0) ? "有数据越界，详见「鱼缸情况」页。"
                                          : "各项数据正常。");
     ui_lvgl_chat_add(UI_CHAT_ASSISTANT, greet);
-    ui_lvgl_chat_add(UI_CHAT_SYSTEM,
-                     "语音对话待 P7 接入；当前可用：拍照");
+    /* 按键的用法要写出来：语音键现在只剩一个**图标**，「按住」这个动作
+       光看麦克风图标猜不到（图标通常意味着"点一下"）。
+       连接状态由 xz_on_state 那条"小智已连接。"负责，不在这里抢话说。 */
+    ui_lvgl_chat_add(UI_CHAT_SYSTEM, "按住下方麦克风键说话。");
 
-    /* 摄像头可用性一次性问清并写进按钮状态。
-       摄像头在 app_main 第 6.6 步就初始化过了，此处只读状态。
-       不可用时把按钮置灰并在聊天里说明原因 —— 用户看到的是"为什么"，
-       不必去翻串口。 */
-    if (camera_service_is_ready()) {
-        ui_lvgl_set_camera_ready(true);
-    } else {
-        ESP_LOGW(TAG, "摄像头不可用，AI 页拍照按钮已置灰：%s",
-                 camera_service_status());
+    /* 摄像头可用性一次性问清并**写进聊天流**。
+       P6-a 时这一步是控制「拍照」按钮的置灰；那个按钮 2026-10-14 去掉了，
+       但这条信息仍然有用 —— 拍照现在由 AI 驱动，摄像头要是坏的，
+       用户会只看到"AI 说它看不到"，在这里先把原因说清楚，省得去翻串口。 */
+    if (!camera_service_is_ready()) {
+        ESP_LOGW(TAG, "摄像头不可用（AI 拍照会失败）：%s", camera_service_status());
         ui_lvgl_chat_add(UI_CHAT_SYSTEM, camera_service_status());
-        ui_lvgl_set_camera_ready(false);
     }
 
     const TickType_t period = pdMS_TO_TICKS(APP_UI_REFRESH_PERIOD_MS);
@@ -1329,13 +1354,6 @@ static void ui_task(void *arg)
          * vTaskDelayUntil 的绝对节拍推进，避免误差累积。
          */
         vTaskDelayUntil(&last_wake, period);
-
-        /* 拍照请求：按 **30ms 节拍**检查（不跟着下面的 200ms 数据节流走）——
-           用户按下到开始拍摄的延迟应当短。整个动作在**锁外**执行，
-           理由见 ui_capture_photo() 的说明。 */
-        if (ui_lvgl_capture_requested()) {
-            ui_capture_photo();
-        }
 
         /* 告警变化 → 往聊天流里发一条**系统**消息。
            为什么用系统角色而不是助手角色：告警是"设备在通知你"，
@@ -1702,6 +1720,16 @@ void app_main(void)
     };
     xz_set_callbacks(&xz_cbs);
 
+    /* MCP 工具的数据源。同样必须在 start() **之前**注册：服务器在 hello 之后
+       **立刻**就会发工具请求（P7 收尾时实测到的），注册晚了那一次只能回
+       "取不到数据"，而 LLM 只会看到一次失败。 */
+    xz_set_tank_status_provider(tank_status_provider);
+
+    /* 拍照工具的数据源。同样要在 start() 之前注册 ——
+       工具表在连接建立时就报给服务器了，数据源后注册的话，
+       模型第一次调拍照就会拿到"没注册"这条路。 */
+    xz_set_camera_capture_provider(camera_capture_provider);
+
     const esp_err_t xret = xz_client_start();
     if (xret != ESP_OK) {
         ESP_LOGW(TAG, "小智客户端启动失败: %s（其余功能不受影响）",
@@ -1710,6 +1738,11 @@ void app_main(void)
         /* 纳入栈水位监控。这个任务要跑 **TLS 握手**，是全工程栈最吃紧的一个，
            必须能看到它的高水位读数。任务名见 xiaozhi_client.c 的 xTaskCreate。 */
         monitor_register("xz_client", xTaskGetHandle("xz_client"));
+        /* 工具任务也要盯 —— 它跑 JPEG 编码 + esp_http_client，是本工程里
+           调用链最深的一条（初值照 xiaozhi 的 8192，要靠实测水位来收）。
+           ⚠️ 这是第 8 格，加完 s_monitored[] 就满了：再加任务必须先扩容
+              APP_MAX_MONITORED_TASKS，否则 monitor_register 会静默丢弃。 */
+        monitor_register(XZ_TOOL_TASK_NAME, xTaskGetHandle(XZ_TOOL_TASK_NAME));
     }
 
     ok = xTaskCreatePinnedToCore(monitor_task, "monitor_task",

@@ -34,6 +34,11 @@ extern "C" {
 #define XZ_WS_HANDSHAKE_MS      10000   /* 等 WebSocket 101 响应（web_socket.cc:173-179） */
 #define XZ_WS_HELLO_TIMEOUT_MS  10000   /* 等服务器 hello（websocket_protocol.cc:188-193） */
 
+/** vision 上传（拍照给 AI 看）的超时。
+ *  比 OTA 那 10 秒宽得多：服务器要在那边跑一个视觉模型才回得来。
+ *  这条路径跑在**工具任务**上，不是 WebSocket 任务，所以占着不碍事。 */
+#define XZ_VISION_TIMEOUT_MS    30000
+
 /** 无任何入站数据多久算通道超时、需要重连。
  *  出处：`protocol.cc:81-90` 的 `kTimeoutSeconds = 120`。
  *  注意 xiaozhi **不发应用层心跳**（它的 `Ping()` 全工程无调用者），
@@ -77,6 +82,38 @@ extern "C" {
 #define XZ_TASK_STACK           6144
 #define XZ_TASK_PRIO            3       /* 与 mqtt_task 同级：网络类，不该压过 UI */
 #define XZ_TASK_CORE            0       /* 与 Wi-Fi/MQTT 同核；core1 已被 UI/LVGL/传感器占满 */
+
+/* ==========================================================================
+ * MCP 工具任务（跑"慢工具"—— 目前就是拍照上传）
+ * ========================================================================== */
+
+/** 跑慢工具的任务栈。**初值照搬 xiaozhi**：
+ *  `application.cc:610-613` 的 `main_event_loop` 是 `2048 * 4 = 8192`，
+ *  而那正是它执行 `camera->Capture()` / `Explain()` 的任务 —— 同一职责、
+ *  同一量级的调用链（JPEG 编码器 + esp_http_client），所以从它的数字起步，
+ *  比拍脑袋估一个靠谱。
+ *
+ *  ⚠️ 这是**初值，不是结论**：跑过一轮拍照后按 monitor_task 的实测水位收，
+ *     收到"峰值 + 一倍余量"为止（工程里 XZ_TASK_STACK 就是这么从
+ *     8192 收到 6144 的）。**不要在没跑过拍照的情况下凭开机水位去收它** ——
+ *     开机时这条任务还没干过活，水位读数是假的。 */
+#define XZ_TOOL_TASK_STACK      8192
+#define XZ_TOOL_TASK_PRIO       3       /* 与 xz_client/mqtt 同级 */
+#define XZ_TOOL_TASK_CORE       0       /* 与 Wi-Fi 同核，但优先级不高于它 */
+
+/** 任务名。main 侧要用它取任务句柄做栈水位监控，故不能在两处各写一份字面量。 */
+#define XZ_TOOL_TASK_NAME       "xz_tool"
+
+/** 待执行工具请求的队列深度。
+ *  深度 2 而不是 1：偶发的连续两次调用（用户追问）不该被拒。
+ *  满了两条还在来，说明模型在乱调，回 busy 比无限排队好。 */
+#define XZ_MCP_QUEUE_LEN        2
+
+/** 工具调用里字符串参数的存放上限（`question`）。 */
+#define XZ_MCP_QUESTION_MAX     256
+
+/** 工具结果文本的上限。服务器回的视觉描述可能不短，给宽一点。 */
+#define XZ_MCP_RESULT_MAX       512
 
 #ifdef __cplusplus
 }

@@ -12,6 +12,10 @@
 #include "esp_err.h"
 #include "xiaozhi_client.h"
 
+/* xz_mcp_handle() 的参数是解析好的 cJSON 子树，所以这里要 cJSON 的类型。
+   本头文件只在组件内部使用（不对外），而 json 已在 PRIV_REQUIRES 里。 */
+#include "cJSON.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -105,6 +109,45 @@ const char *xz_ws_session_id(void);
 
 /** 服务器下行的采样率（服务器 hello 的 audio_params.sample_rate，通常 24000）。 */
 int xz_ws_server_sample_rate(void);
+
+/* ==========================================================================
+ * MCP 工具服务端（实现在 xiaozhi_mcp.c，P7 阶段 4）
+ * ========================================================================== */
+
+/**
+ * @brief 处理一条 MCP 请求并回包。
+ *
+ * @param payload 服务器消息里 `payload` 那个子树（**不含**外层信封），
+ *                已由调用方 cJSON_Parse 出来，本函数不改动它。
+ *
+ * ⚠️ 在 **esp_websocket_client 自己的任务**上被调用，且回包也在这条任务上发出。
+ *    工具实现必须快（见 xiaozhi_mcp.c 的文件头）。
+ *    **慢工具（拍照）不走这里同步执行** —— 它们由 xz_mcp_start_worker()
+ *    建的工具任务执行，本函数只负责入队后立即返回。
+ */
+void xz_mcp_handle(const cJSON *payload);
+
+/**
+ * @brief 创建慢工具队列与执行任务（幂等）。由 xz_client_start() 调用。
+ * @return ESP_OK；任务/队列创建失败时返回 ESP_ERR_NO_MEM。
+ */
+esp_err_t xz_mcp_start_worker(void);
+
+/* ==========================================================================
+ * 视觉上传（实现在 xiaozhi_vision.c）
+ *
+ * 服务器在 MCP initialize 里下发 vision 地址；xiaozhi_mcp.c 收到后就存进这里。
+ * ========================================================================== */
+
+/** 记下本次会话的 vision 地址与 token（token 就是 session_id，每会话一变）。 */
+void xz_vision_set(const char *url, const char *token);
+
+/** 本次会话是否有 vision 地址可用。 */
+bool xz_vision_is_ready(void);
+
+/** 上传一张 JPEG 取回解释文本。失败时 out 里仍会写入一句给 LLM 看的说明。 */
+esp_err_t xz_vision_upload(const uint8_t *jpeg, size_t jpeg_len,
+                           const char *question, char *out, size_t out_cap);
 
 #ifdef __cplusplus
 }

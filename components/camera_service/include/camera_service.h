@@ -43,6 +43,16 @@
  *   · **绝不可**在持有 LVGL 锁时调用 —— 会把 taskLVGL 一起卡住，界面停摆；
  *   · 也**不可**在中断里调用。
  * 推荐做法：界面上的按钮只置一个标志，由 `ui_task` 在**锁外**轮询后调用。
+ *
+ * 【两个调用者】（P7 加拍照给 AI 之后）
+ * 现在是 ui_task（用户按按钮）和 xiaozhi 的工具任务（AI 拍照）**都会调**，
+ * 所以组件内部用一把互斥锁把整个抓帧过程串起来 —— 驱动那边是 `fb_count=1`
+ * 的单帧缓冲，跑并发会互相把帧抢走。
+ *
+ * ⚠️ 取锁是**带超时**的（`CAMERA_SERVICE_LOCK_TIMEOUT_MS`），不是死等：
+ *    若在这里 `portMAX_DELAY`，AI 拍照期间用户按了拍照键，ui_task 会被挂住
+ *    最长 4 秒 —— 界面连同触摸一起冻住，看起来像死机，而**那正是本组件最
+ *    不该造成的事**。取不到锁就返回 `ESP_ERR_TIMEOUT`，界面提示重试即可。
  * ============================================================================
  */
 #pragma once
@@ -90,6 +100,18 @@ extern "C" {
  *  代价只有一次开机延迟，而模组供电未稳时 SCCB 探测失败是很难查的故障。 */
 #define CAMERA_SERVICE_POWER_SETTLE_MS 100
 
+/** 抓帧互斥锁的等待上限。见头文件线程约束 —— **不要改成 portMAX_DELAY**。 */
+#define CAMERA_SERVICE_LOCK_TIMEOUT_MS 500
+
+/** JPEG 编码质量，与 xiaozhi 的 `frame2jpg_cb(fb_, 80, ...)` 一致。 */
+#define CAMERA_SERVICE_JPEG_QUALITY    80
+
+/** JPEG 输出缓冲上限（PSRAM）。QVGA@q80 实测约十几 KB，64KB 留足余量且富余。
+ *
+ *  ⚠️ 这个值是**硬边界**，超了整次拍照判失败（不是截断），所以宁可给宽点：
+ *     一旦撞上它，现象是"AI 拍照失败"，而不是悄悄上传一张半截图。 */
+#define CAMERA_SERVICE_JPEG_MAX        (64 * 1024)
+
 /** 镜像 / 翻转。**由实测决定，不要凭空写。**
  *  确定方法：拍一张有明确左右/上下特征的画面（例如拍一段文字），
  *  对着屏幕核对。若文字左右反了 ⇒ 置 HMIRROR=1；上下颠倒 ⇒ VFLIP=1。
@@ -134,6 +156,31 @@ const char *camera_service_status(void);
  * @warning **阻塞调用**，最长约 4 秒。见文件头的线程约束。
  */
 esp_err_t camera_service_capture(void);
+
+/**
+ * @brief 抓一帧、**编码成 JPEG**、并把结果留在一个自有缓冲里。
+ *
+ * 这条路径是给「把小智看到的画面传给服务器做视觉理解」用的：抓帧、预热、
+ * 尺寸校验与 `camera_service_capture()` 走的是**同一段代码**，区别只在多一步
+ * 编码。因此调用本函数之后，`camera_service_frame()` 拿到的 RGB565 画面
+ * 也已经是这一帧 —— 想顺带上屏不需要再拍一次。
+ *
+ * @param[out] out      JPEG 数据起点
+ * @param[out] out_len  JPEG 字节数
+ * @return ESP_OK；ESP_ERR_TIMEOUT（取帧超时**或**摄像头正忙）；
+ *         ESP_ERR_NO_MEM（JPEG 缓冲分配失败）；ESP_FAIL（编码失败或超出上限）。
+ *
+ * @warning **指针归本组件所有，不要 free**；它在下一次
+ *          `camera_service_capture_jpeg()` 之前有效（与 `camera_service_frame()`
+ *          同一条约定）。调用方应当在拿到之后**尽快用完**（发给服务器），
+ *          而不要把指针存起来。
+ *
+ * @note  编码的是驱动交出的**原始大端 RGB565**，不需要也不应该先做字节交换
+ *        （编码器默认就按大端解读；喂交换过的缓冲反而会把绿色通道打散）。
+ *
+ * @warning **阻塞调用**，最长约 4 秒（取帧）+ 编码时间。约束同 `capture()`。
+ */
+esp_err_t camera_service_capture_jpeg(uint8_t **out, size_t *out_len);
 
 /**
  * @brief 取最近一次成功抓取的画面。

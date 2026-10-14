@@ -450,12 +450,6 @@ static uint16_t      *s_photo_buf[2] = { NULL, NULL };
 static lv_image_dsc_t s_photo_dsc[2];
 static int            s_photo_cur = -1;     /* -1 = 还没显示过任何照片 */
 
-bool ui_lvgl_capture_requested(void)
-{
-    /* 纯读标志，不碰 LVGL，故**不加锁** —— 见 ui_lvgl.h 的调用次序 */
-    return ui_pages_take_capture_request();
-}
-
 void ui_lvgl_chat_add(ui_chat_role_t role, const char *text)
 {
     if (!s_ready || text == NULL || text[0] == '\0') {
@@ -469,23 +463,9 @@ void ui_lvgl_chat_add(ui_chat_role_t role, const char *text)
     (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
 }
 
-void ui_lvgl_set_camera_ready(bool ready)
-{
-    if (!s_ready) {
-        return;
-    }
-    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
-        return;
-    }
-    ui_pages_set_camera_ready(ready);
-    lvgl_port_unlock();
-    (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
-}
-
 bool ui_lvgl_talk_held(void)
 {
-    /* **不加锁** —— 与 ui_lvgl_capture_requested 同理：
-       它只读一个 volatile 标志，目的是让 voice_task 能在锁外轮询。
+    /* **不加锁**：它只读一个 volatile 标志，目的是让 voice_task 能在锁外轮询。
        若在这里加锁，voice_task 每 60ms 抢一次 LVGL 锁，
        会和渲染任务互相拖慢。 */
     if (!s_ready) {

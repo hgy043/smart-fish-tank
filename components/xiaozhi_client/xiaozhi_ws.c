@@ -183,10 +183,14 @@ static void handle_json(const cJSON *root)
                  cJSON_IsString(emo) ? emo->valuestring : "(无)");
 
     } else if (strcmp(type->valuestring, "mcp") == 0) {
-        /* 工具调用。本工程暂未实现 MCP 工具（阶段 4），先记日志。 */
+        /* 工具调用（application.cc:724-727）。payload 是完整的 JSON-RPC 请求，
+           回包也由 xz_mcp_handle() 就地发出去（同一条任务上）。 */
         const cJSON *payload = cJSON_GetObjectItem(root, "payload");
-        ESP_LOGI(TAG, "← mcp 工具调用（尚未实现，忽略）");
-        (void)payload;
+        if (cJSON_IsObject(payload)) {
+            xz_mcp_handle(payload);
+        } else {
+            ESP_LOGW(TAG, "← mcp 消息的 payload 不是对象，忽略");
+        }
 
     } else if (strcmp(type->valuestring, "alert") == 0) {
         const cJSON *msg = cJSON_GetObjectItem(root, "message");
