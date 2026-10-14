@@ -244,3 +244,23 @@ CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
 
 
 
+
+# ============================================================================
+# FATFS（P6-c 接入 TF 卡）
+#
+# 【为什么必须改 LFN】默认是 CONFIG_FATFS_LFN_NONE，也就是**完全没有长文件名**，
+# 名字超过 8.3 的文件在 VFS 里根本访问不到。而本工程要存
+# `photo_20261014_103201.jpg`（24 字符）—— 不改这一项，相册功能从第一步就走不通，
+# 而且失败方式很迷惑：文件在卡上是有的（电脑上看得见），设备这边就是打不开。
+#
+# 选 HEAP 而不是 STACK：HEAP 版每次操作从 ff_memalloc 拿缓冲，而本工程
+# CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y ⇒ 走 PSRAM，不吃内部堆。
+# STACK 版会在**每个用到的任务栈**上放一份，我们的任务栈本来就紧。
+#
+# 【USE_DYN_BUFFERS】默认关时 FF_MAX_SS 被 CONFIG_WL_SECTOR_SIZE(4096) 顶到 4096，
+# 于是每个 FIL 内嵌 4KB 缓冲、FATFS 对象再内嵌 4KB —— 而 SD 卡只用 512 字节扇区。
+# 打开后按实际扇区大小分配，每文件缓冲 4096 → 512。
+# ============================================================================
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_USE_DYN_BUFFERS=y

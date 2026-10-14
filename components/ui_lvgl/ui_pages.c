@@ -21,6 +21,7 @@
 
 #include "ui_dashboard.h"
 #include "ui_theme.h"
+#include "ui_lvgl_config.h"     /* UI_LVGL_ALBUM_* —— 相册缩略图的容量与尺寸 */
 
 #include "font_awesome.h"
 
@@ -673,11 +674,41 @@ static void build_ai_page(lv_obj_t *root)
 }
 
 /* ==========================================================================
- * SD 卡相册页（视觉假数据）
+ * SD 卡相册页（P6-c 接入真实数据）
+ *
+ * 缩略图的**像素缓冲不归本模块**（由 ui_lvgl 分配并持有），本模块只把
+ * `lv_image` 的 src 指向它。为什么这么分：刷新次序是
+ * 「锁内置 NULL → **锁外**解码写缓冲 → 锁内挂上」，中间那段写缓冲的动作
+ * 必须发生在锁外（解码 6 张要几百毫秒，持锁会把界面冻住），
+ * 所以写缓冲的代码得够得着那块内存 —— 由 ui_lvgl 交出来最直接。
  * ========================================================================== */
 #define ALBUM_COLS  3
 #define ALBUM_ROWS  2
 #define ALBUM_CNT   (ALBUM_COLS * ALBUM_ROWS)
+
+/* 格子数与缩略图容量必须一致：少了放不下，多了没处放。
+   钉成编译期断言，免得改一个忘另一个。 */
+_Static_assert(ALBUM_CNT == UI_LVGL_ALBUM_MAX,
+               "相册格子数(ALBUM_CNT)与 UI_LVGL_ALBUM_MAX 不一致");
+
+static lv_obj_t       *s_album_img[ALBUM_CNT];
+static lv_image_dsc_t  s_album_dsc[ALBUM_CNT];
+static lv_obj_t       *s_album_note = NULL;
+static int             s_album_cell_w = 0;
+static int             s_album_cell_h = 0;
+
+/* 相册刷新请求。**只在 ui_pages_show() 里写**（LVGL 上下文）、
+   **只在锁外读** —— 与 s_talk_held 同一条纪律：读侧不碰任何 LVGL 对象。 */
+static volatile bool s_album_refresh = false;
+
+bool ui_pages_album_refresh_requested(void)
+{
+    if (!s_album_refresh) {
+        return false;
+    }
+    s_album_refresh = false;
+    return true;
+}
 
 static void build_album_page(lv_obj_t *root)
 {
@@ -687,6 +718,8 @@ static void build_album_page(lv_obj_t *root)
     const int gap  = 10;
     const int cell_w = (TH_W - 2 * m - (ALBUM_COLS - 1) * gap) / ALBUM_COLS;
     const int cell_h = (TH_H - TH_HEADER_H - 2 * m - 26 - (ALBUM_ROWS - 1) * gap) / ALBUM_ROWS;
+    s_album_cell_w = cell_w;
+    s_album_cell_h = cell_h;
 
     for (int i = 0; i < ALBUM_CNT; i++) {
         const int r = i / ALBUM_COLS;
@@ -703,19 +736,82 @@ static void build_album_page(lv_obj_t *root)
         lv_obj_set_style_border_color(cell, lv_color_hex(TH_EDGE), 0);
         lv_obj_set_style_border_width(cell, 1, 0);
 
-        /* 占位图标：明确是「还没有图」，不是加载失败 */
-        lv_obj_t *ic = lv_label_create(cell);
-        lv_label_set_text(ic, FONT_AWESOME_IMAGE);
-        lv_obj_set_style_text_font(ic, &font_awesome_20_4, 0);
-        lv_obj_set_style_text_color(ic, lv_color_hex(TH_EDGE), 0);
-        lv_obj_center(ic);
+        /* 缩略图。**初始 src 为 NULL** ⇒ 格子就是一块空白，表示"还没有图"。
+           真图由 ui_pages_album_show() 挂上。 */
+        lv_obj_t *img = lv_image_create(cell);
+        lv_obj_remove_flag(img, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_center(img);
+        s_album_img[i] = img;
     }
 
-    lv_obj_t *note = lv_label_create(content);
-    lv_label_set_text(note, "占位缩略图 —— TF 卡驱动接入后显示真实抓拍");
-    lv_obj_set_style_text_font(note, &font_puhui_16_4, 0);
-    lv_obj_set_style_text_color(note, lv_color_hex(TH_LABEL), 0);
-    lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, m, -8);
+    s_album_note = lv_label_create(content);
+    lv_label_set_text(s_album_note, "进入本页后读取 TF 卡…");
+    lv_obj_set_style_text_font(s_album_note, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_album_note, lv_color_hex(TH_LABEL), 0);
+    lv_obj_align(s_album_note, LV_ALIGN_BOTTOM_LEFT, m, -8);
+}
+
+/* --------------------------------------------------------------------------
+ * 以下两个都要求**调用者已持 LVGL 锁**（由 ui_lvgl 负责加解锁）
+ * -------------------------------------------------------------------------- */
+
+/**
+ * @brief 把 6 个格子的图**全部摘掉**。
+ * @note **这一步是"锁外改写缓冲"之所以安全的前提** —— 摘掉之后 LVGL
+ *       不再持有那块内存的任何引用，外面随便写。见 ui_lvgl_config.h 的说明。
+ */
+void ui_pages_album_clear(void)
+{
+    for (int i = 0; i < ALBUM_CNT; i++) {
+        if (s_album_img[i] != NULL) {
+            lv_image_set_src(s_album_img[i], NULL);
+        }
+    }
+}
+
+/**
+ * @brief 把缓冲里的 count 张缩略图挂到前 count 个格子上。
+ * @param buf 连续的一整块，第 i 张在 buf + i*w*h
+ */
+void ui_pages_album_show(const uint16_t *buf, int count, int w, int h)
+{
+    if (buf == NULL || w <= 0 || h <= 0 || count < 0 || count > ALBUM_CNT) {
+        return;
+    }
+    if (s_album_cell_w <= 0 || s_album_cell_h <= 0) {
+        return;
+    }
+
+    /* 缩放到格子内。LVGL 的缩放是**以 256 为 1.0** 的定点数，
+       取两个方向里较小的那个，保证哪一边都不溢出。
+       留 4px 边距，免得图紧贴边框。 */
+    const int32_t sx = (int32_t)((s_album_cell_w - 4) * 256) / w;
+    const int32_t sy = (int32_t)((s_album_cell_h - 4) * 256) / h;
+    const int32_t scale = (sx < sy) ? sx : sy;
+
+    for (int i = 0; i < count; i++) {
+        /* 描述符描述的是**缓冲区里第 i 张**的位置。每次刷新重建一遍 ——
+           它很便宜（几十字节），而且避免"上次的 w/h 残留"这类脏状态。 */
+        memset(&s_album_dsc[i], 0, sizeof(s_album_dsc[i]));
+        s_album_dsc[i].header.magic  = LV_IMAGE_HEADER_MAGIC;
+        s_album_dsc[i].header.cf     = LV_COLOR_FORMAT_RGB565;
+        s_album_dsc[i].header.w      = (uint32_t)w;
+        s_album_dsc[i].header.h      = (uint32_t)h;
+        s_album_dsc[i].header.stride = (uint32_t)w * 2;
+        s_album_dsc[i].data_size     = (uint32_t)((size_t)w * h * 2);
+        s_album_dsc[i].data          = (const uint8_t *)(buf + (size_t)i * w * h);
+
+        lv_image_set_scale(s_album_img[i], scale);
+        lv_image_set_src(s_album_img[i], &s_album_dsc[i]);
+    }
+}
+
+/** @brief 相册页脚注（"共 N 张" / "卡不可用：原因"）。**须已持锁。** */
+void ui_pages_album_note(const char *text)
+{
+    if (s_album_note != NULL) {
+        lv_label_set_text(s_album_note, (text != NULL) ? text : "");
+    }
 }
 
 /* ==========================================================================
@@ -761,6 +857,15 @@ void ui_pages_show(ui_page_t page)
         }
     }
     s_cur = page;
+
+    /* 进入相册页 ⇒ 请求重新读卡。
+       为什么不在切页这里直接把图画出来：扫目录 + 解码 6 张 JPEG 要几百毫秒，
+       而**本函数跑在 LVGL 上下文且已持锁** —— 在这里干就把界面冻住了。
+       所以只置一个标志，由 ui_task 在**锁外**去做（与"按住说话"同一条纪律）。
+       每次进来都重读：卡里的照片可能刚变过（比如刚拍了新的）。 */
+    if (page == UI_PAGE_ALBUM) {
+        s_album_refresh = true;
+    }
 }
 
 void ui_pages_update_tank(const tank_ecosystem_t *snap)

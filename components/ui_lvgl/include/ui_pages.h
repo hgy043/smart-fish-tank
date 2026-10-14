@@ -55,6 +55,44 @@ ui_page_t ui_pages_current(void);
 /** @brief 用一帧快照刷新鱼缸页。**调用者须已持 LVGL 锁。** */
 void ui_pages_update_tank(const tank_ecosystem_t *snap);
 
+/* ==========================================================================
+ * SD 卡相册（P6-c）
+ *
+ * 刷新次序（**这个次序是设计的一部分，不要打乱**）：
+ *
+ *   ui_task:
+ *     if (ui_pages_album_refresh_requested()) {   // ① 锁外轮询
+ *         buf = ui_lvgl_album_begin(...);         // ② 内部上锁：摘掉所有 src
+ *         for (i...) sd_service_load_thumb(...);  // ③ **锁外**解码，几百毫秒
+ *         ui_lvgl_album_commit(...);              // ④ 内部上锁：挂上新 src
+ *     }
+ *
+ * 关键是 ② 与 ④ 之间 LVGL **不持有**那块缓冲的任何引用，所以 ③ 在锁外
+ * 改写它是安全的 —— 这也正是这里**不需要双缓冲**的原因。
+ * （AI 页那张照片气泡要双缓冲，是因为它换图没有这个空窗。）
+ * ========================================================================== */
+
+/**
+ * @brief 【**不加锁**】取走"相册需要刷新"的请求。true = 刚进入相册页。
+ *
+ * @note 与 `ui_pages_talk_held()` 同一条纪律：给 ui_task 在**锁外**轮询用，
+ *       只读一个 volatile 标志，不碰任何 LVGL 对象。读取即清零。
+ */
+bool ui_pages_album_refresh_requested(void);
+
+/** @brief 把 6 个格子的图**全部摘掉** —— 之后外部就可以安全地改写缓冲。
+ *  **调用者须已持 LVGL 锁。** */
+void ui_pages_album_clear(void);
+
+/** @brief 把缓冲里前 count 张挂上显示。
+ *  @param buf 连续一整块，第 i 张在 buf + i*w*h（标准 native RGB565）
+ *  **调用者须已持 LVGL 锁。** */
+void ui_pages_album_show(const uint16_t *buf, int count, int w, int h);
+
+/** @brief 相册页脚注文字（"共 N 张" / "卡不可用：原因"）。
+ *  **调用者须已持 LVGL 锁。** */
+void ui_pages_album_note(const char *text);
+
 /**
  * @brief 建一个统一的页面顶栏（标题 + 可选返回键），返回该页面的内容容器。
  *

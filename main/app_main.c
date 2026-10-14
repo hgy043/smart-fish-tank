@@ -34,6 +34,8 @@
 #include "audio_service.h"
 #include "ui_lvgl.h"
 #include "camera_service.h"
+#include "sd_service.h"
+#include "ui_lvgl_config.h"     /* 只为断言缩略图参数与 sd_service 一致 */
 #include "xiaozhi_client.h"
 #include "xiaozhi_config.h"
 #include "opus_codec.h"
@@ -43,6 +45,7 @@
 #include "app_secrets.h"
 #include "wifi_sta.h"
 #include "bafa_mqtt.h"
+#include "net_time.h"
 
 static const char *TAG = "app_main";
 
@@ -132,7 +135,19 @@ static esp_err_t camera_capture_provider(uint8_t **jpeg, size_t *out_len)
         return ret;
     }
 
-    /* ② 顺带上屏 —— 让用户看得见 **AI 到底看到了什么**。
+    /* ② 顺带存一份到 TF 卡。
+       ⚠️ **存盘失败不影响这次调用** —— 卡满、没插卡、卡是 exFAT，
+       都不该让「AI 看图」这个主功能挂掉。只记日志、继续往下走。
+       （存盘放在上传之前：上传要几秒，先落盘就不怕那些秒里出岔子。） */
+    char name[SD_PHOTO_NAME_MAX];
+    const esp_err_t sret = sd_service_save_photo(*jpeg, *out_len, name, sizeof(name));
+    if (sret != ESP_OK) {
+        ESP_LOGW(TAG, "照片存卡失败：%s（不影响本次看图）", sd_service_status());
+    } else {
+        ESP_LOGI(TAG, "照片已存卡：%s（%u 字节）", name, (unsigned)*out_len);
+    }
+
+    /* ③ 顺带上屏 —— 让用户看得见 **AI 到底看到了什么**。
        这不是装饰：出问题时它能把两种完全不同的故障当场分开 ——
        屏幕上的照片糊了 ⇒ 是拍摄问题；照片清楚但 AI 答得不对 ⇒ 是识别/提示问题。
        少了这一眼，两种故障在日志里长得一模一样。
@@ -145,6 +160,138 @@ static esp_err_t camera_capture_provider(uint8_t **jpeg, size_t *out_len)
         (void)ui_lvgl_show_photo(px, w, h);
     }
     return ESP_OK;
+}
+
+/**
+ * @brief 开机验一遍「从卡里读一张照片 → JPEG 解码 → 得到缩略图」这条路。
+ *
+ * 【为什么值得在开机做】
+ * `sd_service_selftest()` 只验了**裸的字节读写**；而相册真正依赖的是
+ * 「列目录 → 读文件 → 解码 → 尺寸正好是缩略图那么大」。这条链后两步失败时，
+ * 界面上只显示"无法显示"四个字，**看不出是哪一步断的**；而且那是"人主动点进
+ * 相册页"才会走到的路径 —— 排查时得指望人恰好点进去、而且串口恰好在抓。
+ *
+ * 2026-10-14 首次实测就撞上了这个：卡里两张 JPEG，电脑上都能打开，
+ * 相册页却说"最近 0 张（2 张无法显示）"。当时手上没有那条路径的日志。
+ * 把它提到开机日志里，这条路从此每次启动都留下判据。
+ */
+static void sd_probe_newest_thumb(void)
+{
+    char names[1][SD_PHOTO_NAME_MAX];
+    int  count = 0;
+    if (sd_service_list_photos(names, 1, &count) != ESP_OK || count == 0) {
+        ESP_LOGI(TAG, "[SD] 卡上还没有照片，跳过缩略图自检");
+        return;
+    }
+
+    /* 缓冲放 PSRAM 并**用完即还** —— 它不是常驻需求，没必要占着内部堆
+       （内部堆是本工程最紧的资源，见 monitor_task 的读数）。 */
+    uint16_t *buf = (uint16_t *)heap_caps_malloc(
+                        SD_THUMB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        ESP_LOGW(TAG, "[SD] 缩略图自检缓冲分配失败，跳过");
+        return;
+    }
+
+    int w = 0, h = 0;
+    const esp_err_t ret = sd_service_load_thumb(names[0], buf,
+                                                (size_t)SD_THUMB_W * SD_THUMB_H,
+                                                &w, &h);
+    heap_caps_free(buf);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "[SD] 缩略图自检**失败**：%s 解码不出来（%s）",
+                 names[0], esp_err_to_name(ret));
+    } else if (w != SD_THUMB_W || h != SD_THUMB_H) {
+        ESP_LOGE(TAG, "[SD] 缩略图自检**失败**：%s 解出 %dx%d，期望 %dx%d",
+                 names[0], w, h, SD_THUMB_W, SD_THUMB_H);
+    } else {
+        ESP_LOGI(TAG, "[SD] 缩略图自检通过：%s → %dx%d RGB565", names[0], w, h);
+    }
+}
+
+/* ==========================================================================
+ * 相册刷新（P6-c）
+ *
+ * ⚠️ 在 **ui_task 内、LVGL 锁外**执行。扫卡 + 解码 6 张 JPEG 要几百毫秒，
+ *    持锁做会把界面连同触摸一起冻住。
+ *    次序（见 ui_lvgl.h）：锁内摘 src → **这里解码** → 锁内挂 src。
+ *    中间这段安全的前提是 LVGL 已经不持有那块缓冲了 —— 也正因如此
+ *    相册**不需要双缓冲**（而 AI 页那张照片气泡需要，它换图没有这个空窗）。
+ * ========================================================================== */
+
+/* 缩略图参数在 sd_service 与 ui_lvgl 两处各定义一份（组件之间不互相依赖），
+   必须一致：不一致的话 ui_lvgl 的缓冲装不下解码结果，表现为相册永远空白，
+   而日志上只会说"参数超限"，离原因很远。故钉成编译期断言。 */
+_Static_assert(SD_THUMB_MAX == UI_LVGL_ALBUM_MAX &&
+               SD_THUMB_W   == UI_LVGL_ALBUM_W   &&
+               SD_THUMB_H   == UI_LVGL_ALBUM_H,
+               "sd_service 与 ui_lvgl 的缩略图参数不一致 —— 改一个必须改另一个"
+               "（分别在 sd_service.h 与 ui_lvgl_config.h）");
+
+static void ui_album_refresh(void)
+{
+    /* 无论下面走到哪一步，都先把画面上旧的图清掉 ——
+       卡拔了、照片删了，就不该还留着上一次的内容。 */
+    uint16_t *buf = ui_lvgl_album_begin(SD_THUMB_MAX, SD_THUMB_W, SD_THUMB_H);
+
+    if (!sd_service_is_ready()) {
+        /* 卡不可用（没插/exFAT/接线问题）。**这不是错误弹窗**，
+           而是设备的一种正常状态：把原因写在页脚上就够了。 */
+        ui_lvgl_album_commit(0, SD_THUMB_W, SD_THUMB_H);
+        ui_lvgl_album_note(sd_service_status());
+        return;
+    }
+
+    char names[SD_THUMB_MAX][SD_PHOTO_NAME_MAX];
+    int  count = 0;
+    if (sd_service_list_photos(names, SD_THUMB_MAX, &count) != ESP_OK) {
+        ui_lvgl_album_commit(0, SD_THUMB_W, SD_THUMB_H);
+        ui_lvgl_album_note("读取 TF 卡失败");
+        return;
+    }
+    if (count == 0) {
+        ui_lvgl_album_commit(0, SD_THUMB_W, SD_THUMB_H);
+        ui_lvgl_album_note("卡上还没有照片 —— 让小智拍一张试试");
+        return;
+    }
+    if (buf == NULL) {
+        return;             /* 分配失败/取锁超时，里面已经记过日志 */
+    }
+
+    /* ---- ★ 锁外：解码。慢没关系 ---- */
+    int ok = 0;
+    for (int i = 0; i < count; i++) {
+        int w = 0, h = 0;
+        uint16_t *slot = buf + (size_t)ok * SD_THUMB_W * SD_THUMB_H;
+
+        if (sd_service_load_thumb(names[i], slot,
+                                  (size_t)SD_THUMB_W * SD_THUMB_H,
+                                  &w, &h) != ESP_OK) {
+            continue;       /* 单张坏掉不该让整页空着 */
+        }
+        if (w != SD_THUMB_W || h != SD_THUMB_H) {
+            /* 尺寸不是预期值就**跳过**，不能将就显示。
+               整页的图必须同尺寸 —— 描述符里只有一个 stride，
+               尺寸不齐会让后一张读到前一张的像素。
+               本机拍的照片恒为 QVGA→1/2→160×120，走到这里的是从电脑拷进来的。 */
+            ESP_LOGW(TAG, "%s 解出 %dx%d，非 %dx%d，跳过",
+                     names[i], w, h, SD_THUMB_W, SD_THUMB_H);
+            continue;
+        }
+        ok++;
+    }
+
+    ui_lvgl_album_commit(ok, SD_THUMB_W, SD_THUMB_H);
+
+    char note[80];
+    if (ok == count) {
+        snprintf(note, sizeof(note), "最近 %d 张", ok);
+    } else {
+        snprintf(note, sizeof(note), "最近 %d 张（%d 张无法显示）", ok, count - ok);
+    }
+    ui_lvgl_album_note(note);
+    ESP_LOGI(TAG, "相册已刷新：列出 %d 张，显示 %d 张", count, ok);
 }
 
 /** 刷新链路状态字段并更新时间戳 */
@@ -1355,6 +1502,15 @@ static void ui_task(void *arg)
          */
         vTaskDelayUntil(&last_wake, period);
 
+        /* 相册刷新：用户进入相册页时由 ui_pages_show() 置位。
+           扫卡 + 解码 6 张 JPEG 要几百毫秒，整个动作在 **LVGL 锁外**执行 ——
+           持锁做会把界面连同触摸一起冻住。
+           按 30ms 节拍检查而不是跟着下面的 200ms 数据节流走：用户按了菜单
+           就该尽快看到图，不该再等一个数据周期。 */
+        if (ui_lvgl_album_refresh_requested()) {
+            ui_album_refresh();
+        }
+
         /* 告警变化 → 往聊天流里发一条**系统**消息。
            为什么用系统角色而不是助手角色：告警是"设备在通知你"，
            不是"助手在回答你"。用助手角色时它前面没有对应的用户提问，
@@ -1608,6 +1764,25 @@ void app_main(void)
 #endif
     }
 
+    /* 6.8 TF 卡存储（P6-c）
+       与摄像头/音频同一条原则：**失败不致命**。没插卡、卡是 exFAT、
+       接线没接好 —— 都不该让鱼缸停摆，只是相册页会显示"卡不可用"。
+       `sd_service_status()` 里已经备好中文原因，界面直接拿去显示。 */
+    const esp_err_t sdret = sd_service_init();
+    if (sdret != ESP_OK) {
+        ESP_LOGW(TAG, "TF 卡不可用: %s（相册功能不可用，其余不受影响）",
+                 sd_service_status());
+    } else {
+        /* P0.5 的最后一格：**写入 → 读回 → 逐字节比对**。
+           为什么"挂载成功"不算验证过：DAT0 接触不良可以让卡正常初始化，
+           却在数据阶段丢字节 —— 而那种故障平时完全看不出来，
+           要等到某张照片存坏了才发现。逐字节比对是唯一能钉死它的判据。 */
+        (void)sd_service_selftest();
+        /* 再把"读一张真照片并解码"验掉 —— 与上面那条验的不是同一件事，
+           失败原因也完全不同（上面是总线/接触，这里是文件读取+解码）。 */
+        sd_probe_newest_thumb();
+    }
+
     /* 7. 先启动网络服务，再创建依赖它的任务。
        顺序很重要：mqtt_task 一启动就会调用 bafa_mqtt_pump()，若此时发送队列
        还没建好，就会走「服务未就绪」分支。虽然 pump 已经改为等待超时，
@@ -1617,6 +1792,14 @@ void app_main(void)
     if (nret != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi 启动失败: %s（设备将保持离线运行）", esp_err_to_name(nret));
     }
+
+    /* 对时。**非阻塞**：内部起一个一次性任务，先等 Wi-Fi 连上再发 SNTP 请求。
+       为什么必须有它：系统时钟上电停在 1970，照片文件名就只能退回
+       `boot_<开机秒数>` —— 而那个秒数每次重启归零，会让"最近 N 张"
+       的排序跨重启乱掉（新照片排到旧照片前面）。对时后文件名变成
+       `photo_20261014_140808.jpg`，字典序即时间序。
+       失败不致命：退回兜底命名，其余功能不受影响。 */
+    net_time_sync_start();
 
     nret = bafa_mqtt_start();
     if (nret != ESP_OK) {

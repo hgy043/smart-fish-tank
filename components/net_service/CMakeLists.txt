@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS        "wifi_sta.c" "bafa_mqtt.c"
+    SRCS        "wifi_sta.c" "bafa_mqtt.c" "net_time.c"
     INCLUDE_DIRS "include"
     REQUIRES     app_core esp_wifi esp_event esp_netif esp_timer mqtt
     PRIV_REQUIRES nvs_flash
@@ -11,6 +11,7 @@ idf_component_register(
 # ============================================================================
 set_source_files_properties(
     wifi_sta.c
+    net_time.c
     bafa_mqtt.c
     PROPERTIES COMPILE_OPTIONS
     "-Werror=unused-variable;-Werror=unused-function;-Werror=unused-but-set-variable;-Werror=return-type;-Werror=implicit-function-declaration"

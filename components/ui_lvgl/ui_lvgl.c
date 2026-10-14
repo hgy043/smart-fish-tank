@@ -450,6 +450,87 @@ static uint16_t      *s_photo_buf[2] = { NULL, NULL };
 static lv_image_dsc_t s_photo_dsc[2];
 static int            s_photo_cur = -1;     /* -1 = 还没显示过任何照片 */
 
+/* ==========================================================================
+ * SD 卡相册（P6-c）
+ *
+ * 次序见 ui_lvgl.h：**锁内摘 src → 锁外解码写缓冲 → 锁内挂 src**。
+ * 中间那段的"写缓冲"不在这里发生（在 main 的 ui_task 里），
+ * 本文件只负责把缓冲交出去、并在两端把 LVGL 的引用摘干净。
+ * ========================================================================== */
+
+static uint16_t *s_album_buf = NULL;
+
+bool ui_lvgl_album_refresh_requested(void)
+{
+    if (!s_ready) {
+        return false;
+    }
+    /* **不加锁** —— 只读一个 volatile 标志，读侧不碰 LVGL */
+    return ui_pages_album_refresh_requested();
+}
+
+uint16_t *ui_lvgl_album_begin(int count, int w, int h)
+{
+    if (!s_ready || count < 0 || count > UI_LVGL_ALBUM_MAX ||
+        w <= 0 || w > UI_LVGL_ALBUM_W || h <= 0 || h > UI_LVGL_ALBUM_H) {
+        return NULL;
+    }
+
+    /* 分配在**锁外**做（230KB 的 PSRAM 申请不该占着 LVGL 锁）。
+       惰性分配：不进相册页就走不到这里。
+       ⚠️ count == 0 时**不分配** —— 那种调用是"只要把画面清空"（卡不可用、
+       没有照片），要缓冲也没用，白占 230KB。 */
+    if (s_album_buf == NULL && count > 0) {
+        const size_t bytes = (size_t)UI_LVGL_ALBUM_MAX * UI_LVGL_ALBUM_W *
+                             UI_LVGL_ALBUM_H * sizeof(uint16_t);
+        s_album_buf = (uint16_t *)heap_caps_malloc(
+                          bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_album_buf == NULL) {
+            ESP_LOGE(TAG, "相册缓冲分配失败（需 %u 字节 PSRAM）", (unsigned)bytes);
+            return NULL;
+        }
+        ESP_LOGI(TAG, "相册缩略图缓冲就绪：%u 字节（PSRAM）", (unsigned)bytes);
+    }
+
+    /* ★ 摘掉所有 src。**这一步之后外面改写 s_album_buf 才是安全的** ——
+       在此之前 LVGL 可能正在渲染那些图。 */
+    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "相册刷新取锁超时，本轮跳过");
+        return NULL;
+    }
+    ui_pages_album_clear();
+    lvgl_port_unlock();
+
+    return s_album_buf;     /* count == 0 时是 NULL，调用方据此只更新页脚 */
+}
+
+void ui_lvgl_album_commit(int count, int w, int h)
+{
+    if (!s_ready || s_album_buf == NULL) {
+        return;
+    }
+    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "相册提交取锁超时，本轮不更新");
+        return;
+    }
+    ui_pages_album_show(s_album_buf, count, w, h);
+    lvgl_port_unlock();
+    (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
+}
+
+void ui_lvgl_album_note(const char *text)
+{
+    if (!s_ready) {
+        return;
+    }
+    if (!lvgl_port_lock(UI_LVGL_LOCK_TIMEOUT_MS)) {
+        return;
+    }
+    ui_pages_album_note(text);
+    lvgl_port_unlock();
+    (void)lvgl_port_task_wake(LVGL_PORT_EVENT_DISPLAY, NULL);
+}
+
 void ui_lvgl_chat_add(ui_chat_role_t role, const char *text)
 {
     if (!s_ready || text == NULL || text[0] == '\0') {

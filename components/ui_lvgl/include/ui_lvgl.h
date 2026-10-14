@@ -158,6 +158,48 @@ void ui_lvgl_flush_probe(uint32_t frames);
 esp_err_t ui_lvgl_show_photo(const uint16_t *rgb565, int w, int h);
 
 /* ==========================================================================
+ * SD 卡相册缩略图（P6-c）
+ *
+ * 刷新次序（**这个次序是设计的一部分，不要打乱**）：
+ *
+ *     ui_task:
+ *       if (ui_lvgl_album_refresh_requested()) {        // ① 锁外轮询
+ *           uint16_t *buf = ui_lvgl_album_begin(6, 160, 120); // ② 锁内摘 src
+ *           for (i < 6) sd_service_load_thumb(name[i],          // ③ **锁外**
+ *                                             buf + i * 160*120, ...);
+ *           ui_lvgl_album_commit(6, 160, 120);                // ④ 锁内挂 src
+ *       }
+ *
+ * 关键：② 与 ④ 之间 LVGL **不持有**那块缓冲的任何引用，所以 ③ 在锁外改写
+ * 它是安全的。**这正是本模块不需要双缓冲的原因** —— 而 AI 页那张照片气泡
+ * 要双缓冲，是因为它换图没有这个空窗。
+ *
+ * ⚠️ 解码 6 张 JPEG 要几百毫秒。**③ 绝不能挪进 ②/④ 的锁里**，
+ *    否则界面连同触摸一起冻住。
+ * ========================================================================== */
+
+/** @brief 【**不加锁**】取走相册刷新请求。true = 用户刚进入相册页。
+ *  读取即清零。同 `ui_lvgl_talk_held()` 那条纪律。 */
+bool ui_lvgl_album_refresh_requested(void);
+
+/**
+ * @brief 开始一次相册刷新：**摘掉所有缩略图的显示**，并把写入缓冲交出来。
+ *
+ * @return 连续的一整块缓冲（可放 count 张 w×h 的 RGB565）；
+ *         未初始化 / 参数超限 / 取锁超时 / 分配失败 → NULL。
+ *
+ * @warning 返回的指针**归本模块所有，不要 free**，且在下一次 `begin` 之前有效。
+ *          调用方应当在返回后**尽快把图解码进去**，再调 `commit`。
+ */
+uint16_t *ui_lvgl_album_begin(int count, int w, int h);
+
+/** @brief 提交：把缓冲里前 count 张挂上显示（内部上锁）。 */
+void ui_lvgl_album_commit(int count, int w, int h);
+
+/** @brief 设置相册页脚注（内部上锁）。传 NULL 或 "" 即清空。 */
+void ui_lvgl_album_note(const char *text);
+
+/* ==========================================================================
  * 聊天流（WeChat 风格，P6-b）
  * ========================================================================== */
 
