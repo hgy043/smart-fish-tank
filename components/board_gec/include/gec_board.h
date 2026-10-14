@@ -8,9 +8,19 @@
  * 本文件的引脚定义全部取自「已验证可编译烧录」的板级代码：
  *   xiaozhi-esp32-1.9.4-gec/main/boards/gec-esp32s3-board/config.h
  *   xiaozhi-esp32-1.9.4-gec/main/boards/gec-esp32s3-board/gec_esp32s3_board.cc
+ *   06-tcp_client_bafa_mqtt/main/esp32_s3_gec.h（粤嵌自己的 BSP）
+ *
+ * ⚠️ 2026-10-14 查明：上面那个 `gec-esp32s3-board/` **不是粤嵌的原创资料**，
+ *    它是「立创开发板」板级代码（同仓库 `main/boards/lichuang-dev/`）的副本 ——
+ *      · config.json：只差 `"name"` 一个字段，其余逐字节相同
+ *      · config.h   ：只差开头 5 行，而那 5 行正是
+ *                     `@brief 立创开发板硬件配置头文件`；删掉后逐字节相同
+ *    ⇒ **凡只有它一家在说的取值，都应视同「单一未验证来源」。**
+ *    本项目已据此重估全部引脚结论（见 gec_board.h 第二节与 docs/pinmap.md
+ *    文首「来源独立性」；完整比对证据见 docs/2026-10-14-bsp-provenance.md）。
  *
  * 注意：项目 Agent.md 早期版本的引脚表与本文件存在多处冲突（LCD、I2S、LED）。
- * 经与两套厂家代码（小智适配版 + 粤嵌 06 BSP）逐项核对后，以本文件为准；
+ * 经与上述来源逐项核对、并**逐项上板实测**后，以本文件为准；
  * Agent.md 已同步修正。完整对照表与未决项见 smart-fish-tank/docs/pinmap.md。
  * ============================================================================
  */
@@ -80,10 +90,10 @@ extern "C" {
 
 /* ---- LCD 片选必须显式拉低（关键！）----------------------------------------
  *
- * 两套厂家已验证代码都在面板复位后立刻执行本操作：
+ * 两个来源都在面板复位后立刻执行本操作：
  *   06 BSP (esp32_s3_gec.c) : esp_lcd_panel_reset(); lcd_cs(0); esp_lcd_panel_init();
  *                             lcd_cs() => pca9557_set_output_state(LCD_CS_GPIO=0, 0)
- *   xiaozhi (gec_esp32s3_board.cc): pca9557_->SetOutputState(0, 0)
+ *   gec_esp32s3_board.cc（**实为立创代码**，见文件顶部）: pca9557_->SetOutputState(0, 0)
  *
  * ⚠️ PCA9557 上电后输出为高阻/高电平，即 LCD_CS **未被拉低**。此时面板不被选中，
  * 后续所有初始化命令与像素数据都会被忽略 —— 表现为**全程全黑**。
@@ -127,8 +137,9 @@ extern "C" {
  * ⚠️ 2026-10-13 **重大更正：BCLK/WS 曾被错写为 IO39/IO40**
  *
  * 那正是 LCD 的 DC / MOSI（见第三节）。这个错误把本不存在的「C1 引脚冲突」
- * 引成了「本项目最大架构风险」，并浪费了多轮排查。两套厂家已验证代码
- * **完全一致**，都写 BCLK=IO14 / WS=IO13：
+ * 引成了「本项目最大架构风险」，并浪费了多轮排查。两个**相互独立**的来源
+ * （`[06BSP]` 是粤嵌自己的；`[小智]` 那套**实为立创**，见文件顶部）都写
+ * BCLK=IO14 / WS=IO13：
  *
  *   信号   [06BSP] esp32_s3_gec.h:198-202   [小智] gec-esp32s3-board/config.h:21-25
  *   MCLK   GPIO_NUM_38                      GPIO_NUM_38
@@ -212,18 +223,23 @@ extern "C" {
 /* ==========================================================================
  * 七、板载 LED 与按键
  *
- * ⚠️ LED 引脚存在两套厂家资料矛盾，尚未实测裁决：
+ * ⚠️ LED 引脚曾记为「两套厂家资料矛盾，尚未实测裁决」：
  *   - 粤嵌 06 BSP (esp32_s3_gec.c) 的 led_init()/led_toggle() 实际操作 IO10
- *   - 小智适配 (gec-esp32s3-board/config.h) 定义 BUILTIN_LED_GPIO = IO48，
- *     但该宏在其 .cc 全文中从未被引用
- * 详见 docs/pinmap.md 第 6 节。P0.5 实测前不要依赖 LED。
+ *   - gec-esp32s3-board/config.h 定义 BUILTIN_LED_GPIO = IO48，但从未被引用
  *
- * 2026-10-14 补：原理图确认 **IO48 是 TF 卡 CMD** —— 上面那条"小智定义但未
- * 使用"至此有了答案：那个 LED 宏本来就是错的，IO48 从来不是 LED。
+ * 【2026-10-14 结案 —— 两层都查清了】
+ *   ① 那不是「两套粤嵌资料矛盾」，而是**立创的值 vs 粤嵌的值**：
+ *      gec-esp32s3-board/ 整套即立创板级代码的副本（证据见本文件顶部），
+ *      所以 `BUILTIN_LED_GPIO = IO48` 是**立创那块板上的 LED 脚**。
+ *   ② 原理图确认 **IO48 是 TF 卡 CMD**；实测拉低 IO10 时 LED 亮且屏幕闪一下。
+ *   ⇒ 本项目放弃使用板载 LED；IO10 不得用作普通 GPIO（docs/pinmap.md 6 / 8.2）。
  * ========================================================================== */
 
 #define GEC_LED_GPIO_06BSP      GPIO_NUM_10    /* 粤嵌 BSP 实际操作脚 */
-#define GEC_LED_GPIO_XIAOZHI    GPIO_NUM_48    /* 小智适配定义但未使用 */
+#define GEC_LED_GPIO_XIAOZHI    GPIO_NUM_48    /* ⚠️ 名不副实：该值来自**立创**那块板
+                                                * （经 gec-esp32s3-board 转抄）。本板
+                                                * IO48 是 TF 卡 CMD，从来不是 LED。
+                                                * 宏名保留不改，避免无谓改动。 */
 
 /* 按键：两套资料都支持 IO0；IO11 为粤嵌 BSP 独有的第二按键 */
 #define GEC_BOOT_KEY_GPIO       GPIO_NUM_0

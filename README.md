@@ -186,6 +186,7 @@ I (3059) font: 自检通过：U+6B38 普惠体里没有、回退后取到了（1
 | [`docs/architecture.md`](docs/architecture.md) | 分层、任务与核心绑定、同步机制、**硬性线程边界**、启动顺序、实测踩坑记录 |
 | [`docs/2026-10-13-lcd-audio-report.md`](docs/2026-10-13-lcd-audio-report.md) | LCD 点亮与**颜色根因**（BGR + 字节交换为什么缺一不可）、音频排障 |
 | [`docs/2026-10-13-p6a-camera-report.md`](docs/2026-10-13-p6a-camera-report.md) | 摄像头：型号实测、字节序链、并发设计 |
+| [`docs/2026-10-14-bsp-provenance.md`](docs/2026-10-14-bsp-provenance.md) | **板级支持包的来源查证** —— 引为真源的两套板级代码其实**同源**，"两处一致"不等于"两个独立来源" |
 
 开发过程中另有一份 `Agent.md`（面向开发 Agent 的完整上下文：任务栈真值、接口清单、
 任务看板、验收指标、维护记录）。它**只存在于本地、不随仓库发布** —— 因为它是跟着
